@@ -57,6 +57,12 @@ class AnalysisConfig:
     max_clusters: int = 20
     device: str | None = None
     show_plots: bool = False
+    # The embedding model, TF-IDF, and intent-keyword rules are all
+    # English-centric: non-English prompts otherwise get near-useless
+    # features (CJK collapses into one giant TF-IDF token; intent regexes
+    # never match) instead of erroring, silently degrading the analysis.
+    # Translating keeps every row's content instead of dropping it.
+    translate_non_english: bool = True
 
 
 @dataclass
@@ -184,14 +190,35 @@ def run_prompt_analysis(config: AnalysisConfig) -> AnalysisResult:
     print("\n=== CLEANING REPORT ===")
     print_cleaning_report(cleaning_report)
 
+    if config.translate_non_english and not prompts_df.empty:
+        from .translate_dataset import load_translation_cache, save_translation_cache, translate_text_column
+
+        cache_path = output_dir / ".translation_cache.json"
+        cache = load_translation_cache(cache_path)
+        translated, changed = translate_text_column(
+            prompts_df["prompt_text"].tolist(),
+            cache,
+            preserve_code=True,
+            show_progress=True,
+            cache_path=cache_path,
+        )
+        save_translation_cache(cache_path, cache)
+        prompts_df["prompt_text_original"] = prompts_df["prompt_text"]
+        prompts_df["prompt_text"] = translated
+        prompts_df["was_translated"] = prompts_df["prompt_text_original"] != prompts_df["prompt_text"]
+        print(
+            f"Translated {changed} of {len(prompts_df)} prompts to English for embedding/analysis "
+            "(original-language text kept in 'prompt_text_original')."
+        )
+
     cleaned_csv = output_dir / "specstory_prompts_cleaned.csv"
-    prompts_df.to_csv(cleaned_csv, index=False)
+    prompts_df.to_csv(cleaned_csv, index=False, encoding="utf-8-sig")
     print(f"Saved cleaned rows: {cleaned_csv}")
 
     dropped_csv: Path | None = None
     if not dropped_df.empty:
         dropped_csv = output_dir / "specstory_prompts_dropped.csv"
-        dropped_df.to_csv(dropped_csv, index=False)
+        dropped_df.to_csv(dropped_csv, index=False, encoding="utf-8-sig")
         print(f"Saved dropped rows: {dropped_csv}")
 
     texts = prompts_df["prompt_text"].tolist()
@@ -270,7 +297,7 @@ def run_prompt_analysis(config: AnalysisConfig) -> AnalysisResult:
         .reset_index()
         .sort_values("prompt_count", ascending=False)
     )
-    repo_stats.to_csv(analysis_dir / "repo_stats.csv", index=False)
+    repo_stats.to_csv(analysis_dir / "repo_stats.csv", index=False, encoding="utf-8-sig")
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
     axes[0, 0].hist(prompts_df["word_len"], bins=40, color="#4C72B0", edgecolor="white")
@@ -294,7 +321,7 @@ def run_prompt_analysis(config: AnalysisConfig) -> AnalysisResult:
     ax.set_xlabel("% of prompts")
     plt.tight_layout()
     plt.savefig(analysis_dir / "04_intent_taxonomy.png", dpi=150)
-    intent_df.to_csv(analysis_dir / "intent_prevalence.csv")
+    intent_df.to_csv(analysis_dir / "intent_prevalence.csv", encoding="utf-8-sig")
     _maybe_show(config.show_plots)
 
     vectorizer = TfidfVectorizer(max_features=2000, stop_words="english", min_df=2)
@@ -304,7 +331,7 @@ def run_prompt_analysis(config: AnalysisConfig) -> AnalysisResult:
     for cluster_id in sorted(prompts_df["cluster"].unique()):
         mask = prompts_df["cluster"] == cluster_id
         sub = prompts_df[mask]
-        mean_tfidf = np.asarray(tfidf[mask].mean(axis=0)).ravel()
+        mean_tfidf = np.asarray(tfidf[mask.to_numpy()].mean(axis=0)).ravel()
         top_idx = mean_tfidf.argsort()[-8:][::-1]
         intent_mix = {ic.replace("intent_", ""): round(sub[ic].mean() * 100, 1) for ic in intent_cols}
         cluster_profiles.append({
@@ -317,7 +344,7 @@ def run_prompt_analysis(config: AnalysisConfig) -> AnalysisResult:
             "median_words": sub["word_len"].median(),
         })
     cluster_df = pd.DataFrame(cluster_profiles)
-    cluster_df.to_csv(analysis_dir / "cluster_profiles.csv", index=False)
+    cluster_df.to_csv(analysis_dir / "cluster_profiles.csv", index=False, encoding="utf-8-sig")
 
     per_repo = prompts_df.groupby("full_name").size()
     per_file = prompts_df.groupby("source_file").size() if "source_file" in prompts_df.columns else per_repo
@@ -329,7 +356,7 @@ def run_prompt_analysis(config: AnalysisConfig) -> AnalysisResult:
         "herfindahl_repos": round(((per_repo / per_repo.sum()) ** 2).sum(), 4),
         "effective_n_repos": round(1 / ((per_repo / per_repo.sum()) ** 2).sum(), 1),
     })
-    diversity.to_csv(analysis_dir / "diversity_metrics.csv")
+    diversity.to_csv(analysis_dir / "diversity_metrics.csv", encoding="utf-8-sig")
 
     if "has_generated_code" in prompts_df.columns and intent_cols:
         cross = prompts_df.groupby("primary_intent").agg(
@@ -340,7 +367,7 @@ def run_prompt_analysis(config: AnalysisConfig) -> AnalysisResult:
         ).sort_values("n", ascending=False)
         cross["pct_code"] = (cross["pct_code"] * 100).round(1)
         cross["pct_tool"] = (cross["pct_tool"] * 100).round(1)
-        cross.to_csv(analysis_dir / "intent_vs_agent_behavior.csv", index=False)
+        cross.to_csv(analysis_dir / "intent_vs_agent_behavior.csv", index=False, encoding="utf-8-sig")
 
     report_lines = [
         "# SpecStory Corpus — Research Report",
@@ -395,7 +422,7 @@ def run_prompt_analysis(config: AnalysisConfig) -> AnalysisResult:
     report_path.write_text("\n".join(report_lines), encoding="utf-8")
 
     clustered_csv = output_dir / "specstory_prompts_clustered.csv"
-    prompts_df.to_csv(clustered_csv, index=False)
+    prompts_df.to_csv(clustered_csv, index=False, encoding="utf-8-sig")
     np.save(output_dir / "prompt_embeddings.npy", embeddings)
 
     print("\n=== SAVED ARTIFACTS ===")

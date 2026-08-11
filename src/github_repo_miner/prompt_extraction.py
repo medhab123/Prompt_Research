@@ -1,4 +1,4 @@
-"""Extract user prompts from SpecStory session logs (`.specstory/history/*.md`)."""
+"""Extract user prompts and agent turn pairs from SpecStory session logs."""
 
 from __future__ import annotations
 
@@ -12,45 +12,16 @@ from pathlib import Path
 import pandas as pd
 import requests
 
+from .action_labeling import action_label_summary
 from .config import BASE_URL, GITHUB_TOKEN, HEADERS
-from .data_cleaning import classify_noise, sanitize_prompt_text
+from .csv_export import export_prompts_csv
+from .data_cleaning import classify_noise
+from .session_features import enrich_turn_dataset
+from .specstory_parser import SpecStoryTurnPair, parse_specstory_turns
 
 SPECSTORY_ROOT = ".specstory"
 SPECSTORY_HISTORY = ".specstory/history"
 SPECSTORY_PATH_FRAGMENT = ".specstory/history"
-
-# Roles that mark a turn in a SpecStory / chat transcript.
-_ROLE_WORDS = r"(User|Human|Developer|Assistant|Agent|AI|System|Tool)"
-
-# Speaker markers, ordered from most to least specific.
-SPEAKER_PATTERNS = (
-    re.compile(r"^\s*#{1,6}\s*\*{0,3}\s*" + _ROLE_WORDS + r"\b.*$", re.IGNORECASE),
-    re.compile(r"^\s*_{0,3}\*{1,3}\s*" + _ROLE_WORDS + r"\b.*$", re.IGNORECASE),
-    re.compile(r"^\s*" + _ROLE_WORDS + r"\s*:\s*.*$", re.IGNORECASE),
-)
-
-ROLE_COLON_RE = re.compile(r"^\s*" + _ROLE_WORDS + r"\s*:\s*(.*)$", re.IGNORECASE)
-USER_ROLES = {"user", "human", "developer"}
-PROMPT_FIELD_RE = re.compile(r"^\s*(prompt|query|request|instruction)\s*:\s*(.+?)\s*$", re.IGNORECASE)
-
-
-def _speaker_role(line: str) -> str | None:
-    for pattern in SPEAKER_PATTERNS:
-        match = pattern.match(line)
-        if match:
-            return match.group(1).lower()
-    return None
-
-
-def _inline_after_role(line: str) -> str:
-    match = ROLE_COLON_RE.match(line)
-    if match:
-        return match.group(2).strip()
-    return ""
-
-
-def _clean_turn(lines: list[str]) -> str:
-    return sanitize_prompt_text("\n".join(lines))
 
 
 def _is_meaningful_prompt(text: str) -> bool:
@@ -58,12 +29,24 @@ def _is_meaningful_prompt(text: str) -> bool:
 
 
 @dataclass
-class SpecStoryPromptRecord:
+class SpecStoryTurnRecord:
+    """One developer prompt paired with the following agent turn."""
+
     full_name: str
     repo_url: str
     source_file: str
-    prompt_index: int
+    turn_index: int
     prompt_text: str
+    agent_response: str = ""
+    agent_model: str = ""
+    generated_code: str = ""
+    code_block_count: int = 0
+    code_languages: str = ""
+    has_generated_code: bool = False
+    has_tool_use: bool = False
+
+
+MAX_RESPONSE_BYTES = 25_000_000  # a real SpecStory session file has no business being this big
 
 
 def _request_json(url: str, params: dict | None = None) -> dict | list | None:
@@ -77,7 +60,15 @@ def _request_json(url: str, params: dict | None = None) -> dict | list | None:
             continue
 
         if response.status_code == 200:
-            return response.json()
+            content_length = response.headers.get("Content-Length")
+            if content_length and int(content_length) > MAX_RESPONSE_BYTES:
+                print(f"   skipping oversized response ({int(content_length):,} bytes): {url}", flush=True)
+                return None
+            try:
+                return response.json()
+            except (ValueError, MemoryError) as exc:
+                print(f"   skipping unparseable/oversized response ({exc}): {url}", flush=True)
+                return None
         if response.status_code in (403, 429):
             reset_ts = int(response.headers.get("X-RateLimit-Reset", time.time() + 65))
             wait = max(reset_ts - time.time() + 2, 15)
@@ -160,8 +151,14 @@ def discover_specstory_files(full_name: str) -> list[str]:
             if path and _is_specstory_file(path):
                 files[path] = None
 
-    for path in _search_repo_specstory_files(full_name):
-        files[path] = None
+    # The directory walk (Contents API) is "core" quota (5000/hr) and finds
+    # files in the standard location. Code search is scarce "search" quota
+    # (30/min) — only spend it when the walk truly found nothing, not on
+    # every repo regardless. At a few hundred repos, always-on search
+    # fallback was the dominant bottleneck of a full extraction run.
+    if not files:
+        for path in _search_repo_specstory_files(full_name):
+            files[path] = None
 
     return sorted(files)
 
@@ -184,106 +181,126 @@ def fetch_file_text(full_name: str, path: str) -> str:
     return _normalize_text(_decode_file_content(payload))
 
 
-def parse_specstory_prompts(text: str) -> list[str]:
-    """Extract user turns from SpecStory-style transcripts."""
-    prompts: list[str] = []
-    current: list[str] = []
-    capturing = False
-    saw_marker = False
-
-    def flush() -> None:
-        nonlocal current
-        candidate = _clean_turn(current)
-        current = []
-        if candidate:
-            prompts.append(candidate)
-
-    for raw_line in text.splitlines():
-        role = _speaker_role(raw_line)
-        if role is not None:
-            saw_marker = True
-            if capturing and current:
-                flush()
-            capturing = role in USER_ROLES
-            current = []
-            if capturing:
-                inline = _inline_after_role(raw_line)
-                if inline:
-                    current.append(inline)
-            continue
-        if capturing:
-            current.append(raw_line)
-
-    if capturing and current:
-        flush()
-
-    if not saw_marker:
-        for raw_line in text.splitlines():
-            match = PROMPT_FIELD_RE.match(raw_line)
-            if match:
-                prompts.append(_normalize_text(match.group(2)))
-
-    seen: set[str] = set()
-    cleaned: list[str] = []
-    for prompt in prompts:
-        if not _is_meaningful_prompt(prompt):
-            continue
-        if prompt in seen:
-            continue
-        seen.add(prompt)
-        cleaned.append(prompt)
-    return cleaned
+def _pair_to_record(
+    full_name: str,
+    repo_url: str,
+    source_file: str,
+    turn_index: int,
+    pair: SpecStoryTurnPair,
+) -> SpecStoryTurnRecord:
+    return SpecStoryTurnRecord(
+        full_name=full_name,
+        repo_url=repo_url,
+        source_file=source_file,
+        turn_index=turn_index,
+        prompt_text=pair.prompt_text,
+        agent_response=pair.agent_response,
+        agent_model=pair.agent_model,
+        generated_code=pair.generated_code,
+        code_block_count=pair.code_block_count,
+        code_languages=pair.code_languages,
+        has_generated_code=pair.has_generated_code,
+        has_tool_use=pair.has_tool_use,
+    )
 
 
-def extract_specstory_prompts_from_repo(
+def extract_turn_pairs_from_repo(
     full_name: str,
     repo_url: str | None = None,
-) -> list[SpecStoryPromptRecord]:
-    """Pull every user prompt from SpecStory logs in one repository."""
+    *,
+    filter_noise: bool = True,
+) -> list[SpecStoryTurnRecord]:
+    """Pull full prompt/response turn pairs from SpecStory logs in one repository."""
     repo = _fetch_repo(full_name)
     if not repo:
         return []
 
     repo_url = repo_url or repo.get("html_url") or f"https://github.com/{full_name}"
-    records: list[SpecStoryPromptRecord] = []
+    records: list[SpecStoryTurnRecord] = []
 
     for path in discover_specstory_files(full_name):
         text = fetch_file_text(full_name, path)
         if not text:
             continue
 
-        for index, prompt in enumerate(parse_specstory_prompts(text), start=1):
+        for turn_index, pair in enumerate(parse_specstory_turns(text), start=1):
+            if filter_noise and not _is_meaningful_prompt(pair.prompt_text):
+                continue
             records.append(
-                SpecStoryPromptRecord(
-                    full_name=full_name,
-                    repo_url=repo_url,
-                    source_file=path,
-                    prompt_index=index,
-                    prompt_text=prompt,
-                )
+                _pair_to_record(full_name, repo_url, path, turn_index, pair)
             )
 
     return records
 
 
+def turn_records_to_dataframe(records: list[SpecStoryTurnRecord]) -> pd.DataFrame:
+    """Convert turn records to a flat dataframe with standard column names."""
+    rows: list[dict] = []
+    for record in records:
+        rows.append(
+            {
+                "full_name": record.full_name,
+                "repo_url": record.repo_url,
+                "source_file": record.source_file,
+                "turn_index": record.turn_index,
+                "artifact_type": "session_turn_pair",
+                "prompt_text": record.prompt_text,
+                "prompt_length": len(record.prompt_text),
+                "prompt_word_count": len(record.prompt_text.split()),
+                "agent_response": record.agent_response,
+                "agent_response_length": len(record.agent_response),
+                "agent_model": record.agent_model,
+                "generated_code": record.generated_code,
+                "generated_code_length": len(record.generated_code),
+                "code_block_count": record.code_block_count,
+                "code_languages": record.code_languages,
+                "has_generated_code": record.has_generated_code,
+                "has_tool_use": record.has_tool_use,
+                "extraction_method": "specstory_turn_pair_parser",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def _print_extraction_summary(df: pd.DataFrame) -> None:
     if df.empty:
-        print("\nNo SpecStory prompts extracted.", flush=True)
+        print("\nNo SpecStory turn pairs extracted.", flush=True)
         return
 
     repo_count = df["full_name"].nunique()
     file_count = df["source_file"].nunique()
-    print(f"\nSpecStory prompts : {len(df)}", flush=True)
-    print(f"Repos with prompts: {repo_count}", flush=True)
-    print(f"Source files      : {file_count}", flush=True)
+    session_count = df["session_id"].nunique() if "session_id" in df.columns else file_count
+    print(f"\nSpecStory turn pairs : {len(df)}", flush=True)
+    print(f"Repos with turns     : {repo_count}", flush=True)
+    print(f"Sessions (files)     : {session_count}", flush=True)
+    print(f"Source files         : {file_count}", flush=True)
+    if "has_generated_code" in df.columns:
+        print(f"With generated code  : {int(df['has_generated_code'].sum())}", flush=True)
+    if "has_tool_use" in df.columns:
+        print(f"With tool use        : {int(df['has_tool_use'].sum())}", flush=True)
+    if "action_type" in df.columns:
+        print("Action types:", flush=True)
+        for action, count in df["action_type"].value_counts().items():
+            print(f"  {action}: {count}", flush=True)
 
 
-def extract_specstory_prompts_from_candidates(
+def extract_specstory_turns_from_candidates(
     candidate_csv: str | Path,
     output_dir: str | Path = "outputs",
     max_repos: int | None = None,
+    *,
+    enrich: bool = True,
+    checkpoint_every: int = 20,
 ) -> Path:
-    """Extract SpecStory user prompts from mined candidate repositories."""
+    """Extract full turn pairs (prompt + agent response) from candidate repositories.
+
+    A run across hundreds of repos can take a long time (GitHub rate limits)
+    and everything was previously held in memory until one save at the very
+    end — a dropped connection or killed process meant losing all of it.
+    Every `checkpoint_every` repos, progress so far is written to a fixed
+    checkpoint path that gets overwritten in place, so an interrupted run
+    still leaves usable, resumable data on disk.
+    """
     candidate_path = Path(candidate_csv)
     df = pd.read_csv(candidate_path)
     if df.empty:
@@ -292,8 +309,13 @@ def extract_specstory_prompts_from_candidates(
     if max_repos is not None:
         df = df.head(max_repos).copy()
 
+    output_path = Path(output_dir)
+    datasets_dir = output_path / "datasets"
+    datasets_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_file = datasets_dir / f"specstory_turn_pairs_{candidate_path.stem}_checkpoint.csv"
+
     seen: set[str] = set()
-    rows: list[dict] = []
+    records: list[SpecStoryTurnRecord] = []
 
     for index, row in enumerate(df.itertuples(index=False), start=1):
         full_name = getattr(row, "full_name")
@@ -302,38 +324,75 @@ def extract_specstory_prompts_from_candidates(
         seen.add(full_name)
 
         repo_url = getattr(row, "url", None)
-        print(f"[{index:03d}/{len(df)}] SpecStory extract: {full_name}", flush=True)
-        records = extract_specstory_prompts_from_repo(full_name, repo_url=repo_url)
-        for record in records:
-            rows.append(
-                {
-                    "full_name": record.full_name,
-                    "repo_url": record.repo_url,
-                    "source_file": record.source_file,
-                    "artifact_type": "session_prompt",
-                    "prompt_index": record.prompt_index,
-                    "prompt_text": record.prompt_text,
-                    "prompt_length": len(record.prompt_text),
-                    "prompt_word_count": len(record.prompt_text.split()),
-                    "extraction_method": "specstory_turn_parser",
-                }
-            )
+        print(f"[{index:03d}/{len(df)}] SpecStory turn extract: {full_name}", flush=True)
+        try:
+            records.extend(extract_turn_pairs_from_repo(full_name, repo_url=repo_url))
+        except Exception as exc:  # noqa: BLE001 - one bad repo must not kill a multi-hour run
+            print(f"   skipping {full_name} after error: {exc!r}", flush=True)
+            continue
 
-    extracted_df = pd.DataFrame(rows)
+        if checkpoint_every and index % checkpoint_every == 0 and records:
+            checkpoint_df = turn_records_to_dataframe(records)
+            if enrich:
+                checkpoint_df = enrich_turn_dataset(checkpoint_df)
+            checkpoint_df.to_csv(checkpoint_file, index=False, encoding="utf-8-sig")
+            print(f"   checkpoint saved ({len(records)} turn pairs so far): {checkpoint_file}", flush=True)
+
+    extracted_df = turn_records_to_dataframe(records)
+    if enrich and not extracted_df.empty:
+        extracted_df = enrich_turn_dataset(extracted_df)
+
     _print_extraction_summary(extracted_df)
 
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
     ts = pd.Timestamp.utcnow().strftime("%Y%m%d_%H%M")
-    output_file = output_path / f"specstory_prompts_{candidate_path.stem}_{ts}.csv"
+    output_file = datasets_dir / f"specstory_turn_pairs_{candidate_path.stem}_{ts}.csv"
 
-    extracted_df.to_csv(output_file, index=False)
+    extracted_df.to_csv(output_file, index=False, encoding="utf-8-sig")
+    checkpoint_file.unlink(missing_ok=True)
 
-    print(f"Saved: {output_file.name}", flush=True)
+    export_prompts_csv(extracted_df, datasets_dir / f"{output_file.stem}_spreadsheet.csv")
+    export_prompts_csv(
+        extracted_df,
+        datasets_dir / f"{output_file.stem}_prompts_only.csv",
+        prompts_only=True,
+    )
+
+    if enrich and not extracted_df.empty:
+        summary = action_label_summary(extracted_df)
+        pd.DataFrame([summary["counts"]]).to_csv(
+            datasets_dir / f"{output_file.stem}_action_summary.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+
+    print(f"Saved: {output_file}", flush=True)
     return output_file
 
 
+def extract_specstory_prompts_from_repo(
+    full_name: str,
+    repo_url: str | None = None,
+) -> list[SpecStoryTurnRecord]:
+    """Back-compat alias: returns full turn records (not prompt-only)."""
+    return extract_turn_pairs_from_repo(full_name, repo_url=repo_url)
+
+
+def extract_specstory_prompts_from_candidates(
+    candidate_csv: str | Path,
+    output_dir: str | Path = "outputs",
+    max_repos: int | None = None,
+) -> Path:
+    """Back-compat alias: now extracts full turn pairs by default."""
+    return extract_specstory_turns_from_candidates(
+        candidate_csv,
+        output_dir=output_dir,
+        max_repos=max_repos,
+        enrich=True,
+    )
+
+
 # Backwards-compatible aliases for older imports / callers.
-PromptRecord = SpecStoryPromptRecord
-extract_prompts_from_repo = extract_specstory_prompts_from_repo
+PromptRecord = SpecStoryTurnRecord
+SpecStoryPromptRecord = SpecStoryTurnRecord
+extract_prompts_from_repo = extract_turn_pairs_from_repo
 extract_prompts_from_candidates = extract_specstory_prompts_from_candidates

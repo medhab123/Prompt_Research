@@ -70,46 +70,99 @@ $env:GITHUB_TOKEN = "your_token_here"
 
 ## Extract Prompts
 
-After running the miner, you can extract prompt-like text from the candidate repos into a new CSV:
+After running the miner, extract prompts from discovered repos:
 
 ```bash
-python -m github_repo_miner --extract-prompts --candidate-csv outputs/llm_repos_candidate_dataset_<timestamp>.csv
+python -m github_repo_miner --extract-only
 ```
 
-If you omit `--candidate-csv`, the tool will use the newest `llm_repos_candidate_dataset_*.csv` in `outputs/`.
-
-The extractor labels each row with an `artifact_type` and `research_priority`:
-
-| Priority | `artifact_type` | Source |
-| --- | --- | --- |
-| 1 | `session_prompt` | SpecStory user turns in `.specstory/history/*` |
-| 2 | `inline_prompt_comment` | `# Prompt:` / `// Prompt:` comments in source files |
-| 3 | `instruction_file` | `CLAUDE.md`, `AGENTS.md`, `copilot-instructions.md` |
-| 4 | `rules_config` | `.cursor/rules/*`, `.cursorrules` |
-
-To keep only the highest-value artifacts:
+Or run discovery + extraction together (default):
 
 ```bash
-python main.py --extract-prompts --max-priority 2
+python main.py
 ```
 
-Or keep specific types:
+Modes:
+
+| Flag | What it does |
+|------|----------------|
+| (default) | Discover SpecStory repos, then extract prompts |
+| `--discover-only` | GitHub search only |
+| `--extract-only` | Extract from latest `outputs/datasets/specstory_candidates_*.csv` or legacy `llm_repos_candidate_dataset_*.csv` in `outputs/` |
+| `--analyze-csv PATH` | Clean, embed, cluster an existing prompt CSV |
+
+Analyze or cluster an existing dataset:
 
 ```bash
-python main.py --extract-prompts --artifact-types session_prompt,inline_prompt_comment
+python analyze_prompts.py outputs/datasets/specstory_prompts_extracted_20260626.csv
 ```
 
 ## Output
 
-By default, the project writes timestamped CSV files to `outputs/`:
+By default, timestamped CSV files are written to `outputs/` (or `outputs/datasets/` if you organize them):
 
-- `llm_repos_candidate_dataset_<timestamp>.csv`
-- `llm_repos_raw_<timestamp>.csv`
-- `extracted_prompts_<candidate_file>_<timestamp>.csv`
+- `specstory_candidates_<timestamp>.csv` — filtered repo list
+- `specstory_candidates_raw_<timestamp>.csv` — all deduplicated discovery hits
+- `specstory_prompts_<candidate_stem>_<timestamp>.csv` — extracted user prompts
+
+Legacy filenames (`llm_repos_*`, `extracted_prompts_*`) are still supported as fallbacks.
 
 If you run the script in Google Colab, it will also attempt to trigger a download of the filtered dataset.
 
-## Command-line options
+## ML Research Pipeline
+
+Transform the prompt dataset into supervised learning experiments (intent classification, behavior prediction, complexity regression):
+
+```bash
+pip install -r requirements-analysis.txt
+python run_ml_research.py
+```
+
+Default input: `outputs/datasets/specstory_prompts_clustered.csv`
+
+Options:
+
+- `--output-dir outputs/ml` — artifacts directory (tables, figures, report)
+- `--skip-code-embeddings` — skip CodeRankEmbed comparison (faster)
+- `--device cpu|cuda` — embedding device
+- `--min-intent-class-size 30` — drop rare intent classes
+
+Outputs:
+
+- `outputs/ml/ML_RESEARCH_REPORT.md` — research summary
+- `outputs/ml/tables/` — CSV + markdown result tables
+- `outputs/ml/figures/` — UMAP, confusion matrices, model comparisons
+- `outputs/ml/prompt_embeddings.npy` — cached SBERT vectors
+
+## Repository layout
+
+```text
+main.py                          # Entry shim → github_repo_miner.__main__
+analyze_prompts.py               # Clean / embed / cluster CLI
+run_ml_research.py               # Supervised ML research CLI
+reexport_csv.py                  # Spreadsheet-safe CSV re-export utility
+scripts/relocate_outputs.py      # One-time output organization helper
+
+src/github_repo_miner/
+  __main__.py                    # Official CLI (discover / extract / analyze)
+  pipeline.py                    # GitHub repo discovery
+  prompt_extraction.py           # Pull prompts from SpecStory logs
+  specstory_parser.py            # Parse SpecStory markdown transcripts
+  data_cleaning.py               # Noise filtering and deduplication
+  prompt_analysis.py             # Embedding, clustering, descriptive stats
+  csv_export.py                  # Blob offload for large CSV fields
+  ml_research/                   # Supervised ML experiments
+
+outputs/
+  datasets/                      # Canonical CSV datasets
+  analysis/                      # Descriptive analysis figures/tables
+  ml/                            # ML experiment results
+
+archive/                         # Old runs kept for reference (not used by pipeline)
+notebooks/                       # Colab notebook (parallel workflow)
+```
+
+## Command-line options (mining)
 
 ```bash
 python -m github_repo_miner --output-dir outputs --rate-limit-delay 7.5

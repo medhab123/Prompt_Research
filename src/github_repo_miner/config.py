@@ -3,6 +3,34 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
+
+
+def _load_dotenv() -> None:
+    """Populate os.environ from a local .env file, if present.
+
+    Tool-driven shells (this repo is often run one command at a time from an
+    external harness) don't carry `export FOO=bar` between invocations, so a
+    file is the only reliable way to hand in a token without re-exporting it
+    every single command. Existing environment variables always win.
+    """
+    candidates = [Path.cwd() / ".env", Path(__file__).resolve().parents[2] / ".env"]
+    for env_path in candidates:
+        if not env_path.is_file():
+            continue
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+        break
+
+
+_load_dotenv()
 
 BASE_URL = "https://api.github.com"
 

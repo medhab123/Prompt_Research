@@ -58,6 +58,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Display matplotlib figures instead of only saving PNGs.",
     )
+    parser.add_argument(
+        "--max-prompts-per-repo",
+        type=int,
+        default=None,
+        help="Cap rows kept per repo to reduce corpus skew (default: no cap).",
+    )
+    parser.add_argument(
+        "--no-translate",
+        action="store_true",
+        help="Skip translating non-English prompts to English before embedding/analysis "
+        "(default: translate, since the embedding model and intent rules are English-centric).",
+    )
     return parser.parse_args()
 
 
@@ -74,9 +86,11 @@ def main() -> None:
                 min_chars=args.min_chars,
                 min_words=args.min_words,
                 max_chars=args.max_chars,
+                max_prompts_per_repo=args.max_prompts_per_repo,
             ),
             device=args.device,
             show_plots=args.show_plots,
+            translate_non_english=not args.no_translate,
         )
     )
 

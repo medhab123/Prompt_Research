@@ -17,9 +17,13 @@ The pipeline keeps the same core behavior as the original notebook export, but i
 ## Project layout
 
 ```text
-main.py
+main.py                  # Entry shim → github_repo_miner.__main__
 requirements.txt
 README.md
+RESEARCH_PROPOSAL.md      # Current research write-up
+PROJECT_STATUS_UPDATE.md  # Current project status log
+docs/                      # Older planning/pipeline-explanation docs
+scripts/                   # All other CLI entry points (see below)
 src/github_repo_miner/
   __init__.py
   __main__.py
@@ -94,7 +98,7 @@ Modes:
 Analyze or cluster an existing dataset:
 
 ```bash
-python analyze_prompts.py outputs/datasets/specstory_prompts_extracted_20260626.csv
+python scripts/analyze_prompts.py outputs/full_run_v3_analysis/specstory_prompts_cleaned.csv
 ```
 
 ## Output
@@ -109,39 +113,57 @@ Legacy filenames (`llm_repos_*`, `extracted_prompts_*`) are still supported as f
 
 If you run the script in Google Colab, it will also attempt to trigger a download of the filtered dataset.
 
-## ML Research Pipeline
+## Action-Type Prediction Pipeline (current research)
 
-Transform the prompt dataset into supervised learning experiments (intent classification, behavior prediction, complexity regression):
+The active research target is `action_type` — predicting whether a coding
+agent's next turn will be `implement`/`debug`/`explain`/`review`/`tool_only`/
+`other`. See `RESEARCH_PROPOSAL.md` for the full write-up. This supersedes
+the older `primary_intent`-based `run_ml_research.py` pipeline (still present
+in `scripts/` but not the current research target — see `archive/README.md`
+for why it was superseded).
 
 ```bash
 pip install -r requirements-analysis.txt
-python run_ml_research.py
+
+# 1. LLM-assisted relabeling of the corpus (rule-based `action_type` -> validated `llm_action_type`)
+python scripts/run_llm_labeling.py outputs/full_run_v3_analysis/specstory_prompts_cleaned.csv \
+    --output-dir outputs/llm_labels_v3 --full --provider gemini
+
+# 2. Predict action_type from prompt + session history (repo-held-out evaluation)
+python scripts/run_action_prediction.py outputs/llm_labels_v3/llm_labels_full.csv \
+    --output-dir outputs/ml_action_final \
+    --repo-context-csv outputs/full_run_v3_analysis/repo_context.csv \
+    --label-col llm_action_type
 ```
 
-Default input: `outputs/datasets/specstory_prompts_clustered.csv`
+Key options for `run_action_prediction.py`:
 
-Options:
+- `--label-col` — defaults to `llm_action_type` when present, else the rule-based `action_type`
+- `--repo-context-csv` — adds repository-level metadata features (language, stars, size)
+- `--cv-folds` — repository-held-out `GroupKFold` folds for statistical rigor (default 5)
+- `--max-context-turns` — sweep of N previous turns for the context-window experiment
 
-- `--output-dir outputs/ml` — artifacts directory (tables, figures, report)
-- `--skip-code-embeddings` — skip CodeRankEmbed comparison (faster)
-- `--device cpu|cuda` — embedding device
-- `--min-intent-class-size 30` — drop rare intent classes
+Outputs (see `outputs/README.md` for the full breakdown):
 
-Outputs:
-
-- `outputs/ml/ML_RESEARCH_REPORT.md` — research summary
-- `outputs/ml/tables/` — CSV + markdown result tables
-- `outputs/ml/figures/` — UMAP, confusion matrices, model comparisons
-- `outputs/ml/prompt_embeddings.npy` — cached SBERT vectors
+- `outputs/llm_labels_v3/llm_labels_full.csv` — the validated label set
+- `outputs/ml_action_final/ACTION_PREDICTION_REPORT.md` — full results report
+- `outputs/ml_action_final/tables/` — every results table, including per-fold CV data and paired significance tests
 
 ## Repository layout
 
 ```text
 main.py                          # Entry shim → github_repo_miner.__main__
-analyze_prompts.py               # Clean / embed / cluster CLI
-run_ml_research.py               # Supervised ML research CLI
-reexport_csv.py                  # Spreadsheet-safe CSV re-export utility
-scripts/relocate_outputs.py      # One-time output organization helper
+
+scripts/
+  analyze_prompts.py             # Clean / embed / cluster CLI
+  run_llm_labeling.py            # LLM-assisted action_type relabeling (current)
+  run_action_prediction.py       # action_type prediction + evaluation (current)
+  run_ml_research.py             # Older primary_intent ML pipeline (superseded)
+  run_enrich_dataset.py
+  run_robustness_experiments.py
+  run_translate_dataset.py
+  reexport_csv.py                # Spreadsheet-safe CSV re-export utility
+  relocate_outputs.py            # One-time output organization helper
 
 src/github_repo_miner/
   __main__.py                    # Official CLI (discover / extract / analyze)
@@ -150,16 +172,14 @@ src/github_repo_miner/
   specstory_parser.py            # Parse SpecStory markdown transcripts
   data_cleaning.py               # Noise filtering and deduplication
   prompt_analysis.py             # Embedding, clustering, descriptive stats
+  action_labeling.py             # Rule-based action_type weak supervision
+  repo_context.py                # Repository-level metadata fetcher
   csv_export.py                  # Blob offload for large CSV fields
-  ml_research/                   # Supervised ML experiments
+  ml_research/                   # Supervised ML experiments, incl. action_prediction.py
 
-outputs/
-  datasets/                      # Canonical CSV datasets
-  analysis/                      # Descriptive analysis figures/tables
-  ml/                            # ML experiment results
-
-archive/                         # Old runs kept for reference (not used by pipeline)
-notebooks/                       # Colab notebook (parallel workflow)
+outputs/                         # Current pipeline outputs — see outputs/README.md
+docs/                            # Older planning/pipeline-explanation docs
+archive/                         # Superseded runs kept for reference — see archive/README.md
 ```
 
 ## Command-line options (mining)

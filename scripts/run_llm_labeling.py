@@ -11,7 +11,7 @@ import argparse
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
@@ -34,8 +34,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default=None)
     parser.add_argument("--sample-size", type=int, default=300, help="Stratified sample size (ignored with --full).")
     parser.add_argument("--full", action="store_true", help="Label the entire dataset instead of a sample.")
-    parser.add_argument("--rate-limit-delay", type=float, default=3.0, help="Seconds between API calls.")
+    parser.add_argument("--rate-limit-delay", type=float, default=3.0, help="Seconds between API calls (per worker).")
     parser.add_argument("--checkpoint-every", type=int, default=25)
+    parser.add_argument("--max-workers", type=int, default=4, help="Concurrent labeling requests (default: 4).")
     return parser.parse_args()
 
 
@@ -77,12 +78,20 @@ def main() -> None:
         checkpoint_path=checkpoint_path,
         checkpoint_every=args.checkpoint_every,
         rate_limit_delay=args.rate_limit_delay,
+        max_workers=args.max_workers,
     )
 
     suffix = "full" if args.full else "sample"
     out_path = args.output_dir / f"llm_labels_{suffix}.csv"
     labeled.to_csv(out_path, index=False, encoding="utf-8-sig")
     print(f"\nSaved: {out_path}")
+
+    unlabeled = (labeled["llm_action_type"] == "") | labeled["llm_action_type"].isna()
+    if unlabeled.any():
+        print(f"\n{int(unlabeled.sum())} rows never got a label this run (quota/errors) — excluded from kappa below.")
+    labeled = labeled[~unlabeled].reset_index(drop=True)
+    if labeled.empty:
+        raise SystemExit("No rows were successfully labeled — nothing to score.")
 
     kappa = cohen_kappa(labeled["action_type"], labeled["llm_action_type"])
     print(f"\nCohen's kappa (LLM vs. rule-based action_type): {kappa:.3f}")

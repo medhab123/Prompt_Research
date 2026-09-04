@@ -21,16 +21,35 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 
 import pandas as pd
 
 ACTION_TYPES = ["implement", "debug", "explain", "review", "tool_only", "other"]
 
+# Definitions below encode the working taxonomy established during the human
+# adjudication pass over rule-vs-LLM disagreements (2026-08-26), not just the
+# original generic descriptions — that review found the LLM systematically
+# under-called `debug` (calling a diagnosed-and-fixed bug `explain` when there
+# was no hard stack trace) and that `review` needed an explicit "no reported
+# problem driving it" criterion to stop it bleeding into `debug`/`implement`.
 ACTION_DEFINITIONS = {
     "implement": "The agent writes substantial code, modifies files, or creates new functionality.",
-    "debug": "The agent diagnoses failures, interprets errors, or proposes fixes.",
+    "debug": (
+        "The agent diagnoses a REPORTED problem (an explicit crash/exception/error/build-failure, "
+        "OR a 'this isn't behaving as expected' bug report) and identifies or starts fixing a root "
+        "cause. A concrete root-cause diagnosis is what matters here, NOT whether there's a stack "
+        "trace — a bug fixed via reasoning about behavior (no exception) is still debug."
+    ),
     "explain": "The agent explains concepts, code behavior, or provides guidance without major implementation.",
-    "review": "The agent evaluates, critiques, or suggests improvements to existing code.",
+    "review": (
+        "The agent checks, audits, or critiques existing code, config, or state WITHOUT a reported "
+        "problem driving it — e.g. 'review the config for X', 'check these files for Y, don't change "
+        "anything', verifying something looks right, auditing behavior, or reviewing/summarizing "
+        "project status against a plan. If investigating a 'ran fine but result is missing/wrong' "
+        "report and no concrete root cause has been found yet, lean review, not debug — it flips to "
+        "debug once a root cause is identified and a fix starts."
+    ),
     "tool_only": "The agent primarily performs tool-based actions such as searching, inspecting files, or navigating repositories.",
     "other": "Short, ambiguous, incomplete, or unclear interactions.",
 }
@@ -45,13 +64,33 @@ exactly one of these six categories:
 Rules:
 - Pick exactly one category, even if the turn has elements of several — pick the dominant one.
 - Base your label on what the agent actually did in its response, not just what the developer asked for.
+- debug vs review: the deciding question is "was there a reported problem (crash, error, or 'not
+  behaving as expected') driving this?" If yes and a root cause was identified/fixed, it's debug —
+  regardless of whether there was a stack trace. If the agent is auditing/checking without such a
+  report, it's review, even if it's evaluating code quality or correctness.
+- implement vs explain: this is the fuzziest boundary. If the response contains actual code/diffs/file
+  changes, lean implement. If it's a prose-only description or walkthrough with no visible code change,
+  lean explain, even if it describes what a change would look like.
 - "other" is for genuinely short/ambiguous/incomplete turns, not a catch-all for uncertainty — if you're
   unsure between two specific categories, pick the more likely one and lower your confidence instead.
 - Respond with ONLY the JSON object, no other text.
 """
 
-_PROMPT_TRUNCATE = 1500
-_RESPONSE_TRUNCATE = 2000
+# Generous now that this runs on a billed key — the corpus's median agent_response
+# is ~2000 chars and 50% of rows exceeded the old 2000-char cap entirely (some up
+# to 300K chars), meaning the model was judging over half the corpus on a chopped-
+# off view of what the agent actually did. Raising these costs about $1.70 extra
+# across the full 8,404-row corpus (measured), which is trivial next to the
+# accuracy this recovers for the implement/debug/explain boundary cases.
+_PROMPT_TRUNCATE = 4000
+_RESPONSE_TRUNCATE = 20000
+
+# Bump this whenever ACTION_DEFINITIONS, _SYSTEM_INSTRUCTIONS, or the truncation
+# limits change — it's folded into the cache key so stale labels from an older,
+# less-accurate prompt version can never silently masquerade as already-done
+# under a corrected one. This is what makes a corpus-wide prompt fix safe to ship
+# without a manual cache wipe.
+PROMPT_VERSION = "v2-taxonomy-fix"
 
 
 @dataclass
@@ -71,7 +110,7 @@ def _truncate(text: str, max_chars: int) -> str:
 
 
 def _row_hash(prompt_text: str, agent_response: str) -> str:
-    key = f"{prompt_text}||{agent_response}"
+    key = f"{PROMPT_VERSION}||{prompt_text}||{agent_response}"
     return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
@@ -234,9 +273,9 @@ def resolve_provider(provider: str | None = None) -> tuple[str, str]:
 
 def make_labeler(provider: str, api_key: str, model: str | None = None):
     if provider == "gemini":
-        return GeminiLabeler(api_key, model=model or "gemini-2.0-flash")
+        return GeminiLabeler(api_key, model=model or "gemini-3.1-flash-lite")
     if provider == "groq":
-        return GroqLabeler(api_key, model=model or "llama-3.3-70b-versatile")
+        return GroqLabeler(api_key, model=model or "openai/gpt-oss-120b")
     raise ValueError(f"Unknown provider: {provider}")
 
 
@@ -257,6 +296,90 @@ def save_label_cache(path: Path, cache: dict[str, dict]) -> None:
     path.write_text(json.dumps(cache, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+class _RateLimiter:
+    """Paces calls across ALL worker threads to a single aggregate rate.
+
+    Concurrency without this just multiplies the effective request rate by
+    max_workers, since each worker would otherwise pace itself independently
+    — 4 workers each waiting `rate_limit_delay` between their own calls means
+    ~4x the intended aggregate rate, which trips free-tier limits harder and
+    makes things slower overall (backoff pile-up), not faster. This makes
+    max_workers purely about hiding per-call latency, not about how many
+    calls/second get sent — that's controlled by min_interval alone.
+    """
+
+    def __init__(self, min_interval: float):
+        self.min_interval = min_interval
+        self._lock = Lock()
+        self._next_allowed = 0.0
+
+    def wait(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            delay = max(0.0, self._next_allowed - now)
+            self._next_allowed = max(now, self._next_allowed) + self.min_interval
+        if delay > 0:
+            time.sleep(delay)
+
+
+def _label_one_row(
+    labeler,
+    prompt_text: str,
+    agent_response: str,
+    *,
+    has_generated_code: bool,
+    has_tool_use: bool,
+    code_block_count: int,
+    exemplars_text: str,
+    rate_limiter: "_RateLimiter",
+    max_retries: int,
+    stop_event,
+) -> tuple[str, LabelResult | None]:
+    """Label one row. Pure w.r.t. shared state — returns a status + result for
+    the caller to apply, so cache/dataframe/file writes only ever happen on
+    one thread (the consumer loop), not from inside worker threads.
+    """
+    if stop_event.is_set():
+        return "skipped", None
+
+    row_prompt = build_row_prompt(
+        prompt_text,
+        agent_response,
+        has_generated_code=has_generated_code,
+        has_tool_use=has_tool_use,
+        code_block_count=code_block_count,
+        exemplars_text=exemplars_text,
+    )
+
+    for attempt in range(max_retries):
+        if stop_event.is_set():
+            return "skipped", None
+        rate_limiter.wait()
+        try:
+            candidate = labeler.label(row_prompt)
+        except Exception as exc:  # noqa: BLE001 - a bad row must not kill a multi-hour run
+            # A per-day token quota (as opposed to a per-minute rate limit) doesn't
+            # recover within seconds — retrying just burns quota producing nothing
+            # but failures. Signal every other in-flight/queued worker to stop too.
+            msg = str(exc).lower()
+            if "per day" in msg or "tpd" in msg or "daily" in msg:
+                stop_event.set()
+                return "quota_exhausted", None
+            time.sleep(rate_limiter.min_interval * (2**attempt))
+            continue
+
+        if candidate.error:
+            # Got a response, but it didn't parse into a real label (e.g. a
+            # degenerate {} under load) — retry rather than silently accepting
+            # a fake "other" as if the model had actually classified the row.
+            time.sleep(rate_limiter.min_interval * (2**attempt))
+            continue
+
+        return "ok", candidate
+
+    return "failed", None
+
+
 def label_dataframe(
     df: pd.DataFrame,
     *,
@@ -267,11 +390,31 @@ def label_dataframe(
     checkpoint_every: int = 25,
     rate_limit_delay: float = 3.0,
     max_retries: int = 3,
+    max_workers: int = 4,
 ) -> pd.DataFrame:
-    """Label every row of df; returns df with llm_action_type/llm_confidence/llm_rationale columns."""
+    """Label every row of df; returns df with llm_action_type/llm_confidence/llm_rationale columns.
+
+    Labeling is one API call per row — I/O-bound, so rows are labeled
+    `max_workers` at a time via a thread pool rather than one at a time.
+    `rate_limit_delay` is the minimum interval between calls **in aggregate**
+    across all workers (see _RateLimiter) — max_workers controls how many
+    calls can be in flight at once (hides per-call latency), not how many
+    calls/second get sent (that's rate_limit_delay alone). Without this
+    split, N workers each pacing independently would multiply the effective
+    send rate by N, tripping free-tier limits harder and making a run slower
+    overall, not faster.
+    A shared stop signal means a detected daily-quota exhaustion halts every
+    worker promptly instead of each one independently burning through retries
+    on an already-dead quota.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from threading import Event
+
     provider_name, api_key = resolve_provider(provider)
     labeler = make_labeler(provider_name, api_key, model=model)
-    print(f"Using provider={provider_name} model={model or '(default)'}")
+    rate_limiter = _RateLimiter(rate_limit_delay)
+    print(f"Using provider={provider_name} model={model or '(default)'} workers={max_workers} "
+          f"min_interval={rate_limit_delay}s", flush=True)
 
     exemplars = select_exemplars(df) if "action_type" in df.columns else []
     exemplars_text = _format_exemplars(exemplars)
@@ -283,97 +426,103 @@ def label_dataframe(
     out["llm_rationale"] = ""
     out["llm_error"] = ""
 
-    n = len(out)
-    labeled_this_run = 0
-    rows_completed = 0
-    for i, (idx, row) in enumerate(out.iterrows(), start=1):
+    to_label: list[tuple[object, str]] = []  # (row index, content-hash key)
+    for idx, row in out.iterrows():
         prompt_text = str(row.get("prompt_text", ""))
         agent_response = str(row.get("agent_response", ""))
         key = _row_hash(prompt_text, agent_response)
-
         if key in cache:
             cached = cache[key]
             out.at[idx, "llm_action_type"] = cached["action_type"]
             out.at[idx, "llm_confidence"] = cached["confidence"]
             out.at[idx, "llm_rationale"] = cached["rationale"]
-            rows_completed = i
-            continue
+        else:
+            to_label.append((idx, key))
 
-        row_prompt = build_row_prompt(
-            prompt_text,
-            agent_response,
-            has_generated_code=bool(row.get("has_generated_code", False)),
-            has_tool_use=bool(row.get("has_tool_use", False)),
-            code_block_count=int(row.get("code_block_count", 0) or 0),
-            exemplars_text=exemplars_text,
-        )
+    n_total = len(out)
+    n_to_label = len(to_label)
+    print(f"{n_to_label} rows to label ({n_total - n_to_label} already cached)", flush=True)
 
-        result = None
-        quota_exhausted = False
-        for attempt in range(max_retries):
-            try:
-                candidate = labeler.label(row_prompt)
-            except Exception as exc:  # noqa: BLE001 - a bad row must not kill a multi-hour run
-                # A per-day token quota (as opposed to a per-minute rate limit) doesn't
-                # recover within seconds — retrying just burns through remaining rows
-                # producing nothing but failures. Bail out of the whole run instead.
-                msg = str(exc).lower()
-                if "per day" in msg or "tpd" in msg or "daily" in msg:
-                    quota_exhausted = True
-                    print(f"  [{i}/{n}] daily quota exhausted: {exc!r}")
-                    break
-                wait = rate_limit_delay * (2**attempt)
-                print(f"  [{i}/{n}] error (attempt {attempt + 1}/{max_retries}): {exc!r} — waiting {wait:.0f}s")
-                time.sleep(wait)
-                continue
+    stop_event = Event()
+    completed = 0
+    labeled_this_run = 0
+    consecutive_failures = 0
+    # A hard daily quota doesn't always say "daily" in its error text (e.g. Gemini's
+    # free-tier RESOURCE_EXHAUSTED message doesn't) and can look superficially like a
+    # transient rate limit ("retry in 26s") when it actually won't recover for hours.
+    # Treating N fully-failed rows in a row as systemic (regardless of error text) is
+    # what actually catches this — this loop is single-threaded (as_completed consumer),
+    # so no lock is needed for the counter.
+    consecutive_failure_limit = 10
 
-            if candidate.error:
-                # Got a response, but it didn't parse into a real label (e.g. a
-                # degenerate {} under load) — retry rather than silently accepting
-                # a fake "other" as if the model had actually classified the row.
-                wait = rate_limit_delay * (2**attempt)
-                print(f"  [{i}/{n}] malformed response (attempt {attempt + 1}/{max_retries}): {candidate.error} — retrying in {wait:.0f}s")
-                time.sleep(wait)
-                continue
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_item = {}
+        for idx, key in to_label:
+            row = out.loc[idx]
+            future = executor.submit(
+                _label_one_row,
+                labeler,
+                str(row.get("prompt_text", "")),
+                str(row.get("agent_response", "")),
+                has_generated_code=bool(row.get("has_generated_code", False)),
+                has_tool_use=bool(row.get("has_tool_use", False)),
+                code_block_count=int(row.get("code_block_count", 0) or 0),
+                exemplars_text=exemplars_text,
+                rate_limiter=rate_limiter,
+                max_retries=max_retries,
+                stop_event=stop_event,
+            )
+            future_to_item[future] = (idx, key)
 
-            result = candidate
-            break
+        for future in as_completed(future_to_item):
+            idx, key = future_to_item[future]
+            completed += 1
+            status, result = future.result()
 
-        if quota_exhausted:
-            print(f"Stopping at row {i}/{n} — daily quota exhausted. Already-labeled rows are cached; "
-                  f"rerun later (same command) or with a different --model to pick up where this left off.")
-            break
+            if status == "quota_exhausted":
+                out.at[idx, "llm_error"] = "quota_exhausted"
+            elif status == "skipped":
+                out.at[idx, "llm_error"] = "skipped_after_quota_exhausted"
+            elif status == "failed" or result is None:
+                # Leave llm_action_type blank (its initialized default) rather than
+                # a fake "other" — a real classification and "the call kept failing"
+                # must stay distinguishable downstream (kappa scoring, resumability).
+                out.at[idx, "llm_confidence"] = 0.0
+                out.at[idx, "llm_error"] = "failed_after_retries"
+                consecutive_failures += 1
+                if consecutive_failures >= consecutive_failure_limit and not stop_event.is_set():
+                    stop_event.set()
+                    print(f"\n{consecutive_failures} rows in a row failed every retry — "
+                          f"treating this as a systemic/quota problem and stopping early "
+                          f"instead of burning hours retrying a dead quota.", flush=True)
+            else:
+                out.at[idx, "llm_action_type"] = result.action_type
+                out.at[idx, "llm_confidence"] = result.confidence
+                out.at[idx, "llm_rationale"] = result.rationale
+                out.at[idx, "llm_error"] = result.error
+                # Only a genuinely parsed, successful label is cached — a failed
+                # or skipped row must not look "already done" on the next run.
+                cache[key] = {
+                    "action_type": result.action_type,
+                    "confidence": result.confidence,
+                    "rationale": result.rationale,
+                }
+                labeled_this_run += 1
+                consecutive_failures = 0
 
-        if result is None:
-            # Do NOT cache this — it's a transient failure, not a real label. Caching it
-            # would make a rerun treat this row as "already done" and skip it forever.
-            out.at[idx, "llm_action_type"] = "other"
-            out.at[idx, "llm_confidence"] = 0.0
-            out.at[idx, "llm_rationale"] = ""
-            out.at[idx, "llm_error"] = "failed_after_retries"
-            rows_completed = i
-            time.sleep(rate_limit_delay)
-            continue
+            if completed % 10 == 0 or completed == n_to_label:
+                print(f"  [{completed}/{n_to_label}] labeled (this run: {labeled_this_run})", flush=True)
 
-        out.at[idx, "llm_action_type"] = result.action_type
-        out.at[idx, "llm_confidence"] = result.confidence
-        out.at[idx, "llm_rationale"] = result.rationale
-        out.at[idx, "llm_error"] = result.error
-        cache[key] = {"action_type": result.action_type, "confidence": result.confidence, "rationale": result.rationale}
-        labeled_this_run += 1
-        rows_completed = i
+            if checkpoint_path and checkpoint_every and completed % checkpoint_every == 0:
+                out.to_csv(checkpoint_path, index=False, encoding="utf-8-sig")
+                save_label_cache(cache_path, cache)
 
-        if i % 10 == 0 or i == n:
-            print(f"  [{i}/{n}] labeled (this run: {labeled_this_run}, from cache: {i - labeled_this_run})")
-
-        if checkpoint_path and checkpoint_every and i % checkpoint_every == 0:
-            out.iloc[:i].to_csv(checkpoint_path, index=False, encoding="utf-8-sig")
-            save_label_cache(cache_path, cache)
-
-        time.sleep(rate_limit_delay)
+    if stop_event.is_set():
+        print("Daily quota was exhausted partway through — some rows are unlabeled (llm_error column). "
+              "Already-labeled rows are cached; rerun later or with a different --model to finish the rest.")
 
     save_label_cache(cache_path, cache)
-    return out.iloc[:rows_completed].reset_index(drop=True) if rows_completed < n else out
+    return out
 
 
 def cohen_kappa(labels_a: pd.Series, labels_b: pd.Series) -> float:

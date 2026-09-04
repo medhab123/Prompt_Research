@@ -76,20 +76,24 @@ The corpus is built from **SpecStory** session logs — Markdown transcripts tha
 
 **Multi-language handling.** Approximately 35% of surviving prompts were in a language other than English (predominantly Chinese, with Russian, French, German, Spanish, Turkish, and Arabic also present). Rather than discard non-English content — which would both shrink the corpus and introduce a systematic bias against certain developer populations — non-English prompts were machine-translated to English for the modeling pipeline, with the original-language text preserved in a separate column for audit and for any future multilingual modeling extension.
 
-**Final corpus:** after noise filtering, exact-duplicate removal, and the per-repository cap: **8,382 developer–agent turns across 252 repositories**, organized into **2,126 distinct multi-turn sessions** (median 13 turns per session).
+**Final corpus:** after noise filtering, exact-duplicate removal, and the per-repository cap: **8,404 developer–agent turns across 251 repositories**, organized into multi-turn sessions.
+
+**Parser correction (post-hoc, see Section 8).** An earlier pass through this pipeline had a bug in the SpecStory transcript parser: one logical agent turn is often split across several consecutive markdown blocks (one per tool call, plus prose), and the parser was only reading the first block, discarding the rest — including, often, the turn's actual closing summary. This silently emptied a substantial fraction of `agent_response` values, which the label rule then routed into `other`/`review` by default. The parser has been fixed (all consecutive assistant blocks are now merged; tool-call blocks are summarized rather than stripped to nothing) and the corpus below reflects the corrected extraction. The numbers in this section and Section 7 are the corrected, validated ones.
 
 ### 4.2 Class distribution
 
 | Action | Count | % of corpus |
 |---|---:|---:|
-| `implement` | 3,896 | 46.5% |
-| `explain` | 2,132 | 25.4% |
-| `other` | 718 | 8.6% |
-| `tool_only` | 679 | 8.1% |
-| `review` | 629 | 7.5% |
-| `debug` | 328 | 3.9% |
+| `implement` | 4,450 | 53.0% |
+| `explain` | 1,598 | 19.0% |
+| `tool_only` | 1,417 | 16.9% |
+| `review` | 352 | 4.2% |
+| `other` | 295 | 3.5% |
+| `debug` | 292 | 3.5% |
 
-The imbalance is not an artifact of sampling — it reflects the genuine skew of real coding-agent sessions, where "write/modify code" requests dominate and narrowly-scoped debugging exchanges are comparatively rare. This is precisely why **macro-F1** (unweighted mean of per-class F1) rather than raw accuracy is the primary evaluation metric throughout: a classifier that always predicts `implement` would already be "right" ~46% of the time without learning anything.
+The imbalance is not an artifact of sampling — it reflects the genuine skew of real coding-agent sessions, where "write/modify code" requests dominate and narrowly-scoped debugging exchanges are comparatively rare. This is precisely why **macro-F1** (unweighted mean of per-class F1) rather than raw accuracy is the primary evaluation metric throughout: a classifier that always predicts `implement` would already be "right" ~53% of the time without learning anything.
+
+*(For reference: before the parser fix, the same pipeline reported implement 46.5%, explain 25.4%, other 8.6%, tool_only 8.1%, review 7.5%, debug 3.9% — `other` and `review` were inflated by the blank-response bug; `tool_only`, which requires real response content to detect, more than doubled after the fix.)*
 
 ---
 
@@ -139,60 +143,74 @@ Primary metric: **macro-F1**. Secondary: accuracy, per-class precision/recall, c
 
 ## 7. Results to Date
 
-*(These are real, already-obtained results from the current pipeline — not projected or illustrative numbers.)*
+*(These are real, already-obtained results from the current pipeline, on the corrected corpus described in Section 4 — not projected or illustrative numbers.)*
 
-**Split:** 201 training repositories / 51 held-out test repositories, 1,607 test rows, confirmed zero repository overlap.
+**Split:** 200 training repositories / 51 held-out test repositories, 1,734 test rows, confirmed zero repository overlap.
 
 ### 7.1 Headline comparison
 
 | Representation | Model | Accuracy | Macro-F1 |
 |---|---|---:|---:|
-| — (majority class) | — | 39.6% | 0.095 |
-| Prompt-only keyword rule | rule-based | 31.8% | 0.257 |
-| `sbert_prompt_only` | MLP | 40.4% | 0.237 |
-| `sbert+prompt_metadata+history` | MLP | 52.3% | **0.412** |
-| `sbert+prompt_metadata+history` | XGBoost | **58.1%** | 0.408 |
+| — (majority class) | — | 43.0% | 0.100 |
+| Prompt-only keyword rule | rule-based | 24.8% | 0.205 |
+| `sbert_prompt_only` | Logistic Regression | 27.9% | 0.223 |
+| `sbert+prompt_metadata+history` | Logistic Regression | 43.2% | **0.348** |
+| `sbert+prompt_metadata+history` | XGBoost | **57.6%** | 0.304 |
 
-**Finding 1 (RQ1, partial support).** A trained model on the prompt alone (macro-F1 0.237) does *not* clearly beat a hand-written keyword rule (0.257) applied to the same prompt-only information. Semantic embeddings are not, by themselves, extracting meaningfully more signal than lexical pattern matching for this task. This is a genuine, non-obvious result worth reporting honestly rather than a null result to bury.
+**Finding 1 (RQ1, partial support).** A trained model on the prompt alone (macro-F1 0.223) modestly beats the hand-written keyword rule (0.205) applied to the same prompt-only information. The margin is real but thin — semantic embeddings extract some signal beyond lexical pattern matching, but not dramatically more, for this task.
 
-**Finding 2 (RQ2, strong support).** Adding prior-turn context nearly doubles macro-F1 (0.237 → 0.412). The size of this jump — not merely its direction — is the project's central empirical finding: short-range conversational context carries substantially more predictive signal than prompt semantics in isolation.
+**Finding 2 (RQ2, supported, revised downward from an earlier measurement).** Adding prior-turn context improves macro-F1 by roughly 56% relative (0.223 → 0.348). An earlier pass through this pipeline (before the parser fix in Section 8) measured a larger jump (0.237 → 0.412, ~74% relative) — some of that gain was an artifact of the blank-response bug, which made certain rows trivially easy to predict once the previous turn's (also bug-affected) label was known. The corrected, smaller effect is the one to report: short-range conversational context carries meaningfully more predictive signal than prompt semantics in isolation, though not as large a margin as first measured.
 
-**Finding 3 (RQ3, supported by design).** Because the improvement in Finding 2 is measured on repositories the model has never seen, the gain is attributable to learned structure in developer–agent interaction patterns (e.g., "a debug turn is often followed by another debug turn," "a long implement streak tends to continue"), not to repository-specific memorization.
+**Finding 3 (RQ3, supported by design).** Because the improvement in Finding 2 is measured on repositories the model has never seen, the gain is attributable to learned structure in developer–agent interaction patterns, not to repository-specific memorization.
 
-### 7.2 Per-class detail (best two models, `sbert+prompt_metadata+history`)
+**Finding 3b.** The best macro-F1 model changed from a nonlinear model (MLP, on the buggy data) to plain logistic regression (on the corrected data). A simpler model winning is, if anything, a healthier sign that this is a real but modest signal rather than something only a complex model could exploit from noise.
 
-| Class | MLP Precision / Recall / F1 | XGBoost Precision / Recall / F1 | Support |
-|---|---|---|---:|
-| `debug` | 0.38 / 0.28 / 0.32 | 0.78 / **0.09** / 0.15 | 82 |
-| `explain` | 0.48 / 0.47 / 0.48 | 0.54 / 0.53 / 0.53 | 460 |
-| `implement` | 0.59 / 0.72 / 0.65 | 0.59 / **0.85** / 0.70 | 637 |
-| `other` | 0.21 / 0.21 / 0.21 | 0.43 / 0.20 / 0.27 | 91 |
-| `review` | 0.34 / 0.24 / 0.28 | 0.48 / **0.13** / 0.20 | 127 |
-| `tool_only` | 0.66 / 0.44 / 0.53 | 0.68 / 0.52 / 0.59 | 210 |
+### 7.2 Per-class detail (best model by macro-F1: Logistic Regression, `sbert+prompt_metadata+history`)
 
-**Finding 4 (RQ4, concrete illustration of why macro-F1 matters).** XGBoost's higher raw accuracy is driven almost entirely by aggressively over-predicting the majority class (`implement` recall 0.85 vs. MLP's 0.72), at the cost of nearly abandoning the rare classes (`debug` recall 0.09, `review` recall 0.13). MLP trades a few points of majority-class recall for meaningfully better minority-class coverage. For any of the motivating use cases in Section 1 (e.g., routing debugging requests to a specialized agent), a model that catches 9% of debug turns is close to non-functional for that purpose despite its better headline accuracy — the exact failure mode macro-F1 as primary metric is designed to surface.
+| Class | Precision | Recall | F1 | Support |
+|---|---:|---:|---:|---:|
+| `implement` | 0.72 | 0.44 | 0.55 | 745 |
+| `tool_only` | 0.53 | 0.57 | 0.55 | 372 |
+| `explain` | 0.40 | 0.32 | 0.36 | 387 |
+| `review` | 0.15 | 0.47 | 0.22 | 68 |
+| `debug` | 0.21 | 0.40 | 0.28 | 90 |
+| `other` | 0.09 | 0.24 | 0.13 | 72 |
 
-**Finding 5.** `explain` and `tool_only` are the most learnable classes for both models — plausibly because they have the clearest surface tells (explicit questions; repository-navigation language) reinforced by session context. `other` is the weakest class for both models (F1 0.21–0.27), consistent with its definition as a residual, low-signal category rather than a coherent behavioral class.
+**Finding 4 (RQ4, concrete illustration of why macro-F1 matters).** A separate comparison model (XGBoost, same representation, higher accuracy at 57.6%) achieves that accuracy by aggressively over-predicting the majority class (`implement` recall 0.85) while nearly abandoning rare classes (`debug` recall 0.09, `review` recall 0.13) — full detail in the project's engineering log. The logistic-regression model reported above trades some majority-class recall for meaningfully better minority-class coverage (`debug` recall 0.40, `review` recall 0.47), which is why it wins on macro-F1 despite lower accuracy. For any of the motivating use cases in Section 1 (e.g., routing debugging requests to a specialized agent), a model that only catches 9% of debug turns is close to non-functional for that purpose despite a better headline accuracy number — the exact failure mode macro-F1 as primary metric is designed to surface.
+
+**Finding 5.** `implement` and `tool_only` are the strongest-supported, most learnable classes post-correction (both benefited directly from the parser fix — see Section 4.2). `other` remains the weakest class (F1 0.13), consistent with its definition as a residual, low-signal category rather than a coherent behavioral class. `review` has low precision but improved recall (0.47) — the model now finds more true review turns, at the cost of more false positives, rather than missing the class almost entirely as in the pre-fix results.
 
 ---
 
 ## 8. Threats to Validity / Limitations
 
-- **Label quality.** Ground truth currently rests on a deterministic rule, not human judgment. Section 5's Tier 2/3 work (LLM-assisted relabeling + human validation, in progress) is the direct mitigation, and any final write-up should report inter-annotator/inter-method agreement (Cohen's κ) rather than treating rule-based labels as ground truth.
-- **Selection bias.** The corpus is limited to repositories where a developer both used SpecStory *and* chose to commit the resulting logs publicly — this is not a random sample of all AI-assisted development, and likely skews toward more experimental, open-source-oriented, or process-transparent developers.
+- **Label quality.** An LLM-assisted relabeling pass (Section 5, Tier 2) has now been run on a stratified 300-row sample (258 successfully labeled before hitting a free-tier daily quota). Agreement with the rule-based labels: **Cohen's κ = 0.323** ("fair" on the standard scale). Per-class agreement is uneven: `implement` 60%, `tool_only` 66%, `explain` 38%, `debug` 34%, `other` 100% (n=8), but **`review` only 8%** — a large, specific disagreement concentrated in one class rather than spread evenly, suggesting `review`'s definition itself (not just execution noise) may need revisiting. A human-adjudication pass on the disagreement cases (Tier 3) is prepared but not yet completed; until it is, neither the rule-based nor the LLM labels should be treated as ground truth, and the `action_type` numbers in Section 7 should be read as resting on a `κ ≈ 0.32`-agreement label source.
+- **Historical data-quality issue, now fixed.** A parser bug (Section 4.2 note) silently emptied a substantial share of `agent_response` values in an earlier pass through this pipeline, inflating the apparent size of the context-window effect in Finding 2 of Section 7. This was caught by investigating *why* the pre-fix κ (0.384) showed near-zero agreement specifically on `tool_only`/`review`, tracing a sampled disagreement back to the raw transcript, and finding the parser had dropped real content. The pipeline has three prior instances of this general failure mode (see project engineering log) — each caught by manually investigating an anomalous number rather than by systematic testing, which is itself evidence that further undiscovered data issues cannot be ruled out.
+- **Selection bias.** The corpus is limited to repositories where a developer both used SpecStory *and* chose to commit the resulting logs publicly — this is not a random sample of all AI-assisted development, and likely skews toward more experimental, open-source-oriented, or process-transparent developers. (Two contemporaneous papers using the same SpecStory + GitHub-mining methodology exist — see Section 3 addendum below — and report comparable corpus sizes, suggesting this selection bias is a property of the data source itself, not an artifact of this project's specific query design.)
 - **Session-boundary effects on the context feature.** The per-repository cap (Section 4.1) samples individual *rows* stratified by action type; it does not guarantee that every turn's immediately-preceding turn survived the same cap. Prior-turn features were computed from the complete, uncapped session at extraction time and are therefore still individually valid, but a richer context representation (raw concatenated prior-turn *text*, rather than summary features) would require re-deriving from complete, uncapped sessions — noted as a scoping decision, not an oversight (Section 9).
-- **Model scale vs. dataset scale.** 8,382 rows is workable for classical ML + embeddings but is a genuine constraint on fine-tuning a full transformer without overfitting; this shaped the model-selection decision in Section 6.2.
+- **Model scale vs. dataset scale.** ~8,400 rows is workable for classical ML + embeddings but is a genuine constraint on fine-tuning a full transformer without overfitting; this shaped the model-selection decision in Section 6.2.
+- **No statistical rigor yet.** All results in Section 7 come from a single train/test split (one seed). No cross-validation, no confidence intervals. The smallest classes (`debug`, `other`, ~70-90 test rows each) have per-class metrics with real sampling variance not currently quantified.
+- **No ablation.** The history representation combines several features (`prev_action_type`, `prev_turn_had_code/tools`, session code-rate, turn position). It is not yet established how much of Finding 2's improvement is attributable to `prev_action_type` alone versus the others — a priority open question, since `prev_action_type`'s contribution could partly reflect autocorrelation in how the label itself is generated rather than purely genuine behavioral continuity.
+
+### Addendum to Section 3 (Related Work) — directly relevant prior work found
+
+Two papers, apparently from the same active research group, use the identical SpecStory + GitHub Code Search mining methodology as this project:
+- Tang, Chen, Fang, Xu, Dhakal, Shi, McMillan, Huang, Li. *"Programming by Chat: A Large-Scale Behavioral Analysis of 11,579 Real-World AI-Assisted IDE Sessions."* arXiv:2604.00436. Builds a behavioral taxonomy (progressive specification, cognitive work redistribution, active collaboration management) — a different axis than `action_type` but directly comparable prior taxonomy work; worth citing and differentiating from explicitly.
+- Fang, Zhang, Tang, McMillan, Li, Huang. *"From Conversation to Contribution: Characterizing Coding Agent in Open-Source Software."* arXiv:2607.05677. Same mining methodology, project-level OSS-collaboration focus rather than per-turn action prediction — evidence the methodology itself is sound, and that this project's specific angle (predictive modeling with repo-held-out evaluation) is not a duplicate of existing work, but must be positioned against it.
+- Ong et al. *"RouteLLM: Learning to Route LLMs with Preference Data."* arXiv:2406.18665. Concrete supporting citation for the model-routing motivation in Section 1 — a trained query-difficulty router achieved >2x cost reduction with minimal quality loss, the same underlying idea (classify the request, then route) applied here to action type instead of raw difficulty.
 
 ---
 
 ## 9. Remaining Work / Next Steps
 
-1. Complete the LLM-assisted labeling validation sample (target: 300 rows, stratified); compute Cohen's κ against rule-based labels.
-2. Human-adjudicate the resulting review sheet; report annotator agreement.
-3. Based on (1)–(2), decide whether to extend LLM labeling to the full 8,382-row corpus and re-run Section 7's experiments against the higher-quality label set.
-4. Extend the context-window experiment from summary history *features* to actual concatenated prior-turn *text* (N=1,2,3 turns), sourced from complete uncapped sessions, as a richer alternative to the current feature-based history representation.
-5. Optional stretch goals: (a) fine-tune a small transformer (DistilBERT/CodeBERT) directly on the classification head as a stronger-but-costlier upper tier; (b) report LLM zero-shot classification performance as an upper-bound reference point, framed as "a trained model recovers X% of LLM-level performance at a fraction of the inference cost" — directly supporting the model-routing motivation in Section 1.
-6. If broader repository coverage is needed, GitHub's code-search API caps each query at 1,000 results; the discovery queries in Section 4.1 already exceed that cap for two of three code-search signals, so query-splitting (e.g., by language) would recover additional repositories not yet reachable.
+1. **Human-adjudicate the disagreement cases** (115 of the 300 sampled rows where the rule and LLM disagreed, prioritized with the 44 `review`-involving cases first). This is the current blocking step — it determines whether the rule-based or LLM labels are closer to correct, or whether `review` needs redefining. *(Infrastructure and prioritized review sheet ready; adjudication itself not yet done.)*
+2. Based on (1): decide whether to extend LLM labeling to the full ~8,400-row corpus and re-run Section 7's experiments against the higher-quality label set; complete the 42 rows not labeled in the current sample due to a daily API quota limit.
+3. Add statistical rigor: repeated repo-held-out splits (`GroupKFold` or multiple `GroupShuffleSplit` seeds), report confidence intervals rather than single point estimates.
+4. Ablation: isolate how much of Finding 2 (history helps) is attributable to `prev_action_type` alone versus the other history features, to rule out label-autocorrelation as an alternative explanation.
+5. Read and cite the two directly-related papers identified in the Section 8 addendum; write an explicit differentiation paragraph for Section 3.
+6. Extend the context-window experiment from summary history *features* to actual concatenated prior-turn *text* (N=1,2,3 turns), sourced from complete uncapped sessions, as a richer alternative to the current feature-based history representation.
+7. Optional stretch goals: (a) try the code-aware embedding model already available in the pipeline (`nomic-ai/CodeRankEmbed`) but not yet evaluated against `action_type`; (b) fine-tune a small transformer (DistilBERT/CodeBERT) as a stronger-but-costlier upper tier; (c) report LLM zero-shot classification performance as an upper-bound reference point, framed as "a trained model recovers X% of LLM-level performance at a fraction of the inference cost" — directly supporting the model-routing motivation in Section 1.
+8. If broader repository coverage is needed, GitHub's code-search API caps each query at 1,000 results; the discovery queries in Section 4.1 already exceed that cap for two of three code-search signals, so query-splitting (e.g., by language) would recover additional repositories not yet reachable.
 
 ---
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -291,15 +292,22 @@ def extract_specstory_turns_from_candidates(
     *,
     enrich: bool = True,
     checkpoint_every: int = 20,
+    max_workers: int = 8,
 ) -> Path:
     """Extract full turn pairs (prompt + agent response) from candidate repositories.
 
-    A run across hundreds of repos can take a long time (GitHub rate limits)
-    and everything was previously held in memory until one save at the very
-    end — a dropped connection or killed process meant losing all of it.
-    Every `checkpoint_every` repos, progress so far is written to a fixed
+    A run across hundreds of repos can take a long time and everything was
+    previously held in memory until one save at the very end — a dropped
+    connection or killed process meant losing all of it. Every
+    `checkpoint_every` repos, progress so far is written to a fixed
     checkpoint path that gets overwritten in place, so an interrupted run
     still leaves usable, resumable data on disk.
+
+    Extraction is I/O-bound (waiting on GitHub API responses), not CPU-bound,
+    so repos are processed `max_workers` at a time via a thread pool instead
+    of one at a time — a single repo's network latency no longer stalls the
+    whole batch. GitHub's authenticated core-API limit is 5000 req/hour;
+    8 concurrent workers stays comfortably inside that for a one-off run.
     """
     candidate_path = Path(candidate_csv)
     df = pd.read_csv(candidate_path)
@@ -315,28 +323,38 @@ def extract_specstory_turns_from_candidates(
     checkpoint_file = datasets_dir / f"specstory_turn_pairs_{candidate_path.stem}_checkpoint.csv"
 
     seen: set[str] = set()
-    records: list[SpecStoryTurnRecord] = []
-
-    for index, row in enumerate(df.itertuples(index=False), start=1):
+    repo_jobs: list[tuple[str, str | None]] = []
+    for row in df.itertuples(index=False):
         full_name = getattr(row, "full_name")
         if full_name in seen:
             continue
         seen.add(full_name)
+        repo_jobs.append((full_name, getattr(row, "url", None)))
 
-        repo_url = getattr(row, "url", None)
-        print(f"[{index:03d}/{len(df)}] SpecStory turn extract: {full_name}", flush=True)
-        try:
-            records.extend(extract_turn_pairs_from_repo(full_name, repo_url=repo_url))
-        except Exception as exc:  # noqa: BLE001 - one bad repo must not kill a multi-hour run
-            print(f"   skipping {full_name} after error: {exc!r}", flush=True)
-            continue
+    total = len(repo_jobs)
+    records: list[SpecStoryTurnRecord] = []
+    completed = 0
 
-        if checkpoint_every and index % checkpoint_every == 0 and records:
-            checkpoint_df = turn_records_to_dataframe(records)
-            if enrich:
-                checkpoint_df = enrich_turn_dataset(checkpoint_df)
-            checkpoint_df.to_csv(checkpoint_file, index=False, encoding="utf-8-sig")
-            print(f"   checkpoint saved ({len(records)} turn pairs so far): {checkpoint_file}", flush=True)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_repo = {
+            executor.submit(extract_turn_pairs_from_repo, full_name, repo_url): full_name
+            for full_name, repo_url in repo_jobs
+        }
+        for future in as_completed(future_to_repo):
+            full_name = future_to_repo[future]
+            completed += 1
+            try:
+                repo_records = future.result()
+                records.extend(repo_records)
+                print(f"[{completed:03d}/{total}] done: {full_name} ({len(repo_records)} turns)", flush=True)
+            except Exception as exc:  # noqa: BLE001 - one bad repo must not kill a multi-hour run
+                print(f"[{completed:03d}/{total}] skipping {full_name} after error: {exc!r}", flush=True)
+
+            if checkpoint_every and completed % checkpoint_every == 0 and records:
+                _save_checkpoint(records, checkpoint_file, enrich)
+
+    if records:
+        _save_checkpoint(records, checkpoint_file, enrich)
 
     extracted_df = turn_records_to_dataframe(records)
     if enrich and not extracted_df.empty:
@@ -369,6 +387,14 @@ def extract_specstory_turns_from_candidates(
     return output_file
 
 
+def _save_checkpoint(records: list[SpecStoryTurnRecord], checkpoint_file: Path, enrich: bool) -> None:
+    checkpoint_df = turn_records_to_dataframe(records)
+    if enrich:
+        checkpoint_df = enrich_turn_dataset(checkpoint_df)
+    checkpoint_df.to_csv(checkpoint_file, index=False, encoding="utf-8-sig")
+    print(f"   checkpoint saved ({len(records)} turn pairs so far): {checkpoint_file}", flush=True)
+
+
 def extract_specstory_prompts_from_repo(
     full_name: str,
     repo_url: str | None = None,
@@ -381,6 +407,8 @@ def extract_specstory_prompts_from_candidates(
     candidate_csv: str | Path,
     output_dir: str | Path = "outputs",
     max_repos: int | None = None,
+    *,
+    max_workers: int = 8,
 ) -> Path:
     """Back-compat alias: now extracts full turn pairs by default."""
     return extract_specstory_turns_from_candidates(
@@ -388,6 +416,7 @@ def extract_specstory_prompts_from_candidates(
         output_dir=output_dir,
         max_repos=max_repos,
         enrich=True,
+        max_workers=max_workers,
     )
 
 

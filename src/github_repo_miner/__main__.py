@@ -57,6 +57,12 @@ def parse_args() -> argparse.Namespace:
         help="Limit repositories processed during prompt extraction.",
     )
     parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=8,
+        help="Concurrent repos to extract at once during prompt extraction (default: 8).",
+    )
+    parser.add_argument(
         "--analyze-csv",
         type=Path,
         help="Analyze an existing SpecStory prompt CSV (clean, embed, cluster, report).",
@@ -102,6 +108,7 @@ def main() -> None:
             candidate_csv,
             output_dir=args.output_dir,
             max_repos=args.max_repos,
+            max_workers=args.max_workers,
         )
         return
 
@@ -122,6 +129,7 @@ def main() -> None:
         result.filtered_csv,
         output_dir=args.output_dir,
         max_repos=args.max_repos,
+        max_workers=args.max_workers,
     )
 
 

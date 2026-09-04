@@ -6,3 +6,6 @@ __pycache__/
 *.egg-info/
 outputs/*.csv
 *.csv
+outputs/
+archive/
+node_modules/

@@ -1,0 +1,15 @@
+sentence-transformers
+umap-learn
+scikit-learn
+matplotlib
+numpy
+torch
+scipy
+xgboost
+pandas
+deep-translator
+langdetect
+tqdm
+google-genai
+groq
+tabulate

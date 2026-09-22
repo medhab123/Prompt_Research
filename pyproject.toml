@@ -4,14 +4,31 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "github-repo-miner"
-version = "0.1.0"
-description = "Mine GitHub repositories for LLM-assisted development signals."
+version = "0.2.0"
+description = "Mine developer-AI coding agent conversations from GitHub, label what the agent did, and predict its next action."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-  "requests",
-  "pandas",
-  "tqdm",
+  # mining
+  "requests>=2.31",
+  "pandas>=2.0",
+  "numpy>=1.26",
+  "tqdm>=4.66",
+  # cleaning + descriptive analysis
+  "deep-translator>=1.11",
+  "langdetect>=1.0.9",
+  "matplotlib>=3.8",
+  "scikit-learn>=1.4",
+  "scipy>=1.11",
+  "sentence-transformers>=3.0",
+  "torch>=2.2",
+  "umap-learn>=0.5.5",
+  # modeling
+  "xgboost>=2.0",
+  "tabulate>=0.9",
+  # LLM labeling
+  "google-genai>=1.0",
+  "groq>=0.9",
 ]
 
 [project.scripts]
@@ -22,3 +39,6 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"github_repo_miner.ml_research" = ["prompts/*.md"]

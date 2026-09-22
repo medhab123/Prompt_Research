@@ -1,7 +1,7 @@
 """Predict action_type (implement/debug/explain/review/tool_only/other) from
 developer prompts, with repo-held-out evaluation and a prompt-only vs.
 prior-turn-history comparison. This targets the actual research spec's label,
-unlike run_ml_research.py which still targets the older primary_intent label.
+unlike the legacy run_ml_research.py, which targets the older primary_intent label.
 """
 
 from __future__ import annotations
@@ -50,7 +50,7 @@ def parse_args() -> argparse.Namespace:
         "--label-col",
         default=None,
         help="Ground-truth column to target. Defaults to llm_action_type when present "
-        "(human-validated as the better label, kappa 0.760 vs 0.614), else action_type.",
+        "(agrees with human adjudication far more often than the rule: kappa 0.512 vs 0.163), else action_type.",
     )
     parser.add_argument(
         "--repo-context-csv",

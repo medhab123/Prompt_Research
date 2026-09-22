@@ -20,6 +20,7 @@ import pandas as pd
 
 from github_repo_miner.ml_research.llm_labeling import (
     ACTION_TYPES,
+    attach_previous_turn,
     build_human_review_sheet,
     cohen_kappa,
     label_dataframe,
@@ -58,6 +59,9 @@ def main() -> None:
 
     df = pd.read_csv(args.input_csv, low_memory=False)
     df = df[df["action_type"].notna()].reset_index(drop=True)
+    # Previous-turn context comes from the whole corpus, so sampled rows keep it too.
+    df = attach_previous_turn(df)
+    print(f"Previous-turn context available for {int(df.get('prev_prompt', pd.Series(dtype=object)).notna().sum())}/{len(df)} rows")
 
     if args.full:
         target_df = df

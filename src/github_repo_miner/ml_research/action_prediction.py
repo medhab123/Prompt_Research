@@ -69,7 +69,7 @@ class ActionPredictionConfig:
     device: str | None = None
     tfidf_max_features: int = 2000
     # Which column to treat as ground truth. Defaults to the LLM-assisted label
-    # (human-validated as the better proxy, kappa 0.760 vs 0.614 for the rule)
+    # (agrees with human adjudication far more often: kappa 0.512 vs 0.163 for the rule)
     # when present, falling back to the rule-based label otherwise so this
     # still runs against older/partial corpora.
     label_col: str | None = None

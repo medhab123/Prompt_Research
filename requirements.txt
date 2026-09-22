@@ -1,3 +1,2 @@
-requests
-pandas
-tqdm
+# Same dependencies as pyproject.toml. Preferred install: pip install -e .
+-e .

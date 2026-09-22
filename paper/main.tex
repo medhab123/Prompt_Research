@@ -1,0 +1,383 @@
+% Predicting a Coding Agent's Next Action Is Mostly a Labeling Problem
+% Workshop submission (non-archival, 4 pages + references).
+%
+% This preamble is self-contained so it compiles anywhere (Overleaf, TeX Live)
+% without a venue style file. To switch to the official workshop template,
+% replace the geometry/title block with \usepackage{neurips_2025} (or whichever
+% style the workshop ships) and keep the body unchanged.
+%
+% !! BEFORE SUBMITTING: verify every entry in the bibliography at the bottom.
+%    Those three references were carried over from the project's own literature
+%    notes and have NOT been re-checked against the arXiv listings.
+\documentclass[10pt]{article}
+\usepackage[letterpaper,margin=1in]{geometry}
+\usepackage{times}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{url}
+\usepackage[hidelinks]{hyperref}
+\usepackage{caption}
+\captionsetup{font=small,labelfont=bf,skip=4pt}
+\usepackage{titlesec}
+\titlespacing*{\section}{0pt}{1.0ex plus .2ex}{0.6ex}
+\setlength{\parskip}{0pt}
+\setlength{\textfloatsep}{8pt}
+
+\title{\vspace{-2em}Predicting a Coding Agent's Next Action Is Mostly a Labeling Problem:\\
+Evidence from 8{,}404 Real Developer--Agent Turns}
+
+\author{%
+  Medha Bhattacharya\\
+  \texttt{medhab2005@gmail.com}
+}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-2em}
+
+\begin{abstract}
+\noindent
+We mine 8{,}404 developer--agent turns from 251 public GitHub repositories that
+commit SpecStory IDE session transcripts, label each turn with what the agent
+\emph{did} (\texttt{implement}, \texttt{debug}, \texttt{explain},
+\texttt{review}, \texttt{tool\_only}, \texttt{other}), and ask whether the
+developer's prompt plus the conversation so far predicts the agent's next action.
+Our answer is a qualified no, and the more useful finding sits one level up. Two
+defensible operationalizations of the \emph{same} six-category taxonomy over the
+\emph{same} turns --- a metadata-informed rule, and an LLM judge reading the full
+prompt/response pair --- agree on only 42.5\% of turns ($\kappa = 0.22$), and
+disagree so systematically that the corpus describes a different phenomenon
+depending on which you believe (\texttt{debug}: 3.5\% of turns under the rule,
+26.6\% under the LLM). Worse, sharpening two category \emph{definitions} and
+re-running the same LLM judge flipped 37.5\% of its labels ($\kappa = 0.54$
+against its own earlier output). Human adjudication of 98 turns favors the LLM
+labels ($\kappa = 0.51$ vs.\ $0.16$) without making them authoritative. Against
+those labels, every representation we test --- TF-IDF, sentence embeddings,
+prompt metadata, prior-turn features, repository metadata, raw prior-turn text
+--- lands in a narrow 0.34--0.38 macro-F1 band under repository-held-out
+evaluation. Prior-turn context helps consistently but slightly ($+0.023$
+macro-F1 across 5 paired folds, $p = 0.0005$), and nearly all of that gain comes
+from one feature: the previous turn's action label. Finally, two successive
+corrections to our own pipeline --- fixing a silently-truncating transcript
+parser, then relabeling --- shrank that same context effect from an initially
+measured $+0.175$ to $+0.023$. We release the corpus, the label sets, and the
+pipeline.
+\end{abstract}
+
+\section{Introduction}
+
+Interpreting agent behavior requires first agreeing on what an agent \emph{did}.
+Much recent work on coding agents evaluates task success; less asks which
+categories of action actually occur in real sessions, whether those categories
+can be reliably assigned, and whether they are anticipatable from what the
+developer said. This paper reports on all three, using real, unsolicited
+developer--agent transcripts rather than benchmark rollouts.
+
+We set out to build a predictor: given the current prompt and the session so
+far, predict the agent's next action type --- a capability that would support
+model routing, tool pre-warming, and adaptive context budgets. We found instead
+that the prediction task is bounded above by a labeling problem we had treated
+as a solved preprocessing step. Our contributions:
+
+\begin{enumerate}\itemsep1pt \parskip0pt \topsep2pt
+\item \textbf{A corpus and pipeline.} 8{,}404 turns across 251 repositories and
+3{,}191 session logs, with session structure, repository metadata, and three
+parallel label sets (rule-based, LLM-assisted, human-adjudicated sample).
+\item \textbf{A label-instability result, along two axes.} Two reasonable
+implementations of the same taxonomy agree on 42.5\% of turns
+($\kappa = 0.22$), with disagreement concentrated in specific categories rather
+than spread as noise --- and one labeler re-run after a refinement to two written
+category definitions agrees with itself on only 62.5\%.
+\item \textbf{A near-negative prediction result.} All representations cluster at
+0.34--0.38 macro-F1 (6 classes, repository-held-out). Conversational context
+yields a small but statistically detectable improvement, almost entirely
+attributable to label autocorrelation; repository metadata and raw prior-turn
+text add nothing.
+\item \textbf{A methodological caution.} How our own headline context effect fell
+from $+0.175$ to $+0.023$ macro-F1 across two corrections, and how the first of
+them was caught.
+\end{enumerate}
+
+\paragraph{Related work.} Two contemporaneous studies mine SpecStory logs
+similarly: Tang et al.~\cite{tang2026programming} build a behavioral taxonomy
+over 11{,}579 IDE sessions, and Fang et al.~\cite{fang2026conversation}
+characterize agent contributions at the project level. Both describe behavior;
+neither asks whether it is predictable turn-to-turn, nor reports agreement
+between alternative labelings of it. Our motivation --- route the request before
+generating the response --- follows RouteLLM~\cite{ong2024routellm}, with action
+type substituted for difficulty.
+
+\section{Corpus}
+
+\textbf{Source and extraction.} SpecStory is an IDE extension that writes
+Markdown transcripts of coding-agent sessions to \texttt{.specstory/history/} in
+the developer's repository. Some developers commit these logs, making real,
+unprompted developer--agent conversation reachable through the GitHub Search API.
+We ran six discovery queries (three repository-search signals: \texttt{specstory
+in:readme}, \texttt{topic:specstory}, \texttt{path:.specstory}; three code-search
+signals over the same paths), crawled each candidate for
+\texttt{.specstory/history/*.md} via the Contents API, and parsed transcripts
+into prompt/response turn pairs, recording prompt and response text, fenced code
+blocks (count, language, length), tool-use blocks, and session identifiers.
+
+\textbf{Cleaning.} From 68{,}943 raw turn pairs we drop empty turns, bare
+acknowledgments (``ok, continue''), pasted IDE diagnostics, browser console
+dumps, CI logs, slash commands, path-only messages, exact duplicates, and
+extreme lengths. Raw turn counts are dominated by a few repositories --- one
+contributed over 30{,}000 turns, almost certainly a looping logging artifact ---
+so we cap each repository at 50 turns, downsampled stratified by action label so
+a repository's behavioral \emph{mix} survives the cap. The result is 8{,}404
+turns across 251 repositories and 3{,}191 session logs, with a repository Gini of
+0.299 and the top 10 repositories supplying 5.9\% of turns.
+
+\textbf{Properties.} Median prompt length is 15 words; 56.7\% of turns have
+fenced code in the agent's response and 23.1\% contain tool-use blocks. Sessions
+have a median of 11 turns (max 207) as recorded before the cap. 31\% of prompts
+were not originally in English (predominantly Chinese); these were
+machine-translated for modeling, with the original text retained. Repositories
+skew small and young (median 0 stars, median age 14.5 months; TypeScript 82,
+Python 50, JavaScript 28), and the corpus captures only developers who both used
+SpecStory \emph{and} committed the logs publicly --- not a random sample of
+AI-assisted development.
+
+\section{Three Labelings of the Same Turns}
+
+\texttt{action\_type} is not in the raw data; it must be constructed. We built it
+three ways. \textbf{(1) Rule:} a deterministic priority-ordered rule over prompt
+and response --- tool use without surfaced code $\rightarrow$ \texttt{tool\_only};
+multi-block or long code $\rightarrow$ \texttt{implement}; otherwise keyword
+regexes over the prompt disambiguate single-block and no-code responses.
+\textbf{(2) LLM judge:} \texttt{gemini-3.1-flash-lite} reads the prompt (up to 4K
+chars), the response (up to 20K chars) and response metadata, and returns a
+category, a confidence and a one-sentence rationale, with in-corpus few-shot
+exemplars. All 8{,}404 turns were labeled (8{,}398 successfully; mean
+self-reported confidence 0.95). \textbf{(3) Human adjudication:} a stratified
+212-turn sample, of which 98 turns --- those where the rule and an earlier LLM
+pass disagreed --- were adjudicated by the author.
+
+These were built in that order, and the order matters: adjudicating the 98 turns
+exposed two category definitions that were doing no work, so \texttt{debug} was
+redefined around ``a concrete root cause was identified'' rather than ``a stack
+trace was present,'' \texttt{review} around ``no reported problem is driving
+this,'' and the whole corpus was relabeled. Everything below, and every model in
+Section 4, uses that final relabeling.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lrrrrrr}
+\toprule
+& \texttt{implement} & \texttt{debug} & \texttt{explain} & \texttt{other} & \texttt{review} & \texttt{tool\_only} \\
+\midrule
+Rule label   & 53.0\% & 3.5\%  & 19.0\% & 3.5\% & 4.2\% & 16.9\% \\
+LLM label    & 39.5\% & 26.6\% & 13.5\% & 7.7\% & 6.8\% & 5.8\%  \\
+\midrule
+Rule recall vs.\ LLM & 0.68 & 0.10 & 0.43 & 0.44 & 0.09 & 0.55 \\
+\bottomrule
+\end{tabular}
+\caption{Class distribution under two labelings of the same 8{,}398 turns, and
+the fraction of each LLM-labeled class that the rule also assigns to that class.
+Overall raw agreement 42.5\%; Cohen's $\kappa = 0.223$.}
+\label{tab:labels}
+\end{table}
+
+\textbf{The labelings disagree, and not randomly.} Agreement is 42.5\%
+($\kappa = 0.223$, ``fair''), and the disagreement is structural
+(Table~\ref{tab:labels}): 1{,}448 turns the rule calls \texttt{implement} the LLM
+calls \texttt{debug}, and 646 turns the rule calls \texttt{tool\_only} the LLM
+calls \texttt{implement}. The rule recovers only 10\% of LLM-\texttt{debug} and
+9\% of LLM-\texttt{review} turns. A reader given the rule labels would conclude
+that debugging is a rare corner of agent work (3.5\% of turns); given the LLM
+labels, that it is the second most common thing agents do (26.6\%). Both
+conclusions come from the same 8{,}398 transcripts.
+
+\textbf{A labeler also disagrees with itself when the definitions move.} We can
+isolate the effect of the definition refinement above, because 299 turns were
+labeled by the same model both before and after it. Only the written definitions
+of \texttt{debug} and \texttt{review} changed; the model, the corpus, the
+metadata and the six category names did not. 37.5\% of the labels flipped
+($\kappa = 0.540$ against its own earlier output). On this sample \texttt{debug}
+rose from 13.0\% to 29.8\% of turns and \texttt{tool\_only} fell from 15.7\% to
+6.0\%.\footnote{This sample is class-stratified, so none of these figures are
+corpus-representative; they describe the sample. The full corpus was labeled
+only under the refined definitions.} The category names were fixed throughout;
+only the guidance text behind them moved --- and with it, the answer to ``how
+much of coding-agent work is debugging?''
+
+\textbf{Human adjudication favors the LLM without settling the question.} On the
+98 adjudicated turns, the final LLM label matched human judgment on 61.2\%
+($\kappa = 0.512$) versus 31.6\% for the rule ($\kappa = 0.163$). The
+pre-refinement LLM labels scored $\kappa = 0.482$ on the same turns, so the
+refinement did move the labels toward the human. If we additionally assume that
+the 76 unadjudicated turns where the rule and the final LLM label agree are
+correct --- an optimistic assumption --- these rise to $\kappa = 0.727$ (LLM) and
+$0.532$ (rule) over $n = 174$. We report both, because the gap measures how much
+of our ``validated'' label quality rests on an untested assumption. Two caveats:
+the 98 turns were selected as disagreements under the \emph{earlier} labeling
+(27 of them now agree), so they are no longer a clean disagreement sample; and
+the annotator saw the earlier LLM label while adjudicating. Either way, the best
+available label set agrees with a careful human reader on roughly six of ten
+hard cases. That is the ceiling the next section is scored against.
+
+\section{Can the Next Action Be Predicted?}
+
+\textbf{Setup.} We target the LLM labels (8{,}398 turns). Repositories --- not
+turns --- are split 80/20 by \texttt{GroupShuffleSplit} (200 train / 51 test
+repositories; 6{,}665 / 1{,}733 turns; zero overlap), so performance must
+generalize across projects rather than memorize a project's vocabulary. No
+response-side column is ever a model input, since the rule label is partly
+derived from such signals: features are the current prompt plus
+\emph{prior}-turn signals, computed with a strict \texttt{shift(1)} within each
+session. The primary metric is macro-F1 over 6 classes. We also run 5-fold
+repository-held-out \texttt{GroupKFold}, reusing the same folds across
+representations so per-fold scores are paired. Models: logistic regression
+(class-balanced), random forest, a 256--128 MLP, and XGBoost.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{llcc}
+\toprule
+Representation & Model & Macro-F1 (5-fold CV) & Accuracy \\
+\midrule
+Majority class$^\dagger$ & --- & 0.086 & 0.350 \\
+Prompt keyword rule$^\dagger$ & --- & 0.320 & 0.428 \\
+\midrule
+SBERT prompt only & logistic reg. & $0.341 \pm 0.014$ & $0.425 \pm 0.022$ \\
+SBERT + prev.\ action only & logistic reg. & $0.361 \pm 0.018$ & $0.444 \pm 0.027$ \\
+SBERT + metadata + history & logistic reg. & $0.364 \pm 0.017$ & $0.446 \pm 0.028$ \\
+SBERT + metadata + history & MLP & $\mathbf{0.364 \pm 0.024}$ & $0.559 \pm 0.025$ \\
+SBERT + metadata + history + repo & logistic reg. & $0.362 \pm 0.015$ & $0.446 \pm 0.028$ \\
+SBERT + metadata + history & XGBoost & $0.308 \pm 0.009$ & $0.568 \pm 0.022$ \\
+\midrule
+Prompt + prior-turn \emph{text}, $N{=}1^\dagger$ & MLP & 0.314 & 0.517 \\
+Prompt + prior-turn \emph{text}, $N{=}3^\dagger$ & MLP & 0.309 & 0.470 \\
+\bottomrule
+\end{tabular}
+\caption{Repository-held-out results against the LLM labels. $\pm$ is the
+standard deviation over 5 repository-held-out folds. $^\dagger$ single split
+only.}
+\label{tab:results}
+\end{table}
+
+\textbf{Everything lands in the same narrow band} (Table~\ref{tab:results}). The
+best configuration reaches 0.364 macro-F1, prompt-only reaches 0.341, and a
+hand-written keyword rule over the prompt alone reaches 0.320: a learned semantic
+representation buys roughly 0.02--0.04 macro-F1 over a regex cascade. Accuracy
+diverges from macro-F1 in the expected way --- XGBoost posts the best accuracy
+(0.568) with the \emph{worst} macro-F1 of the linear and neural families, by
+concentrating predictions on frequent classes.
+
+\textbf{Context helps, consistently and slightly.} Adding prior-turn features to
+the prompt-only model improves macro-F1 by 0.023 on every one of the 5 paired
+folds (deltas $+0.030, +0.018, +0.027, +0.021, +0.020$; paired $t = 10.4$,
+$p = 0.0005$; Wilcoxon $p = 0.0625$, the smallest value attainable at $n{=}5$).
+The effect is real and reproducible. It is also small enough that no downstream
+routing decision would change because of it.
+
+\textbf{And the gain is mostly label autocorrelation.} Replacing the full history
+bundle (previous action, whether the previous turn had code or tool use, rolling
+session code rate, turn position) with the previous turn's action label
+\emph{alone} recovers 0.361 of the 0.364 --- a 0.003 difference not
+distinguishable at this fold count ($p = 0.10$). Sessions are sticky: the best
+single predictor of what the agent does next is what it just did. That is a
+weaker claim than ``conversational context is informative,'' and it is the one
+the data supports.
+
+\textbf{Repository metadata and raw prior text do not help.} Adding repository
+language, stars, size, age and open-issue count changes macro-F1 by $-0.002$.
+Replacing summary history features with the concatenated text of the previous $N$
+turns is \emph{worse} than the prompt alone at every $N$ tested (0.314, 0.301,
+0.309 for $N = 1,2,3$ vs.\ 0.357 prompt-only, same split): prior-turn text
+dilutes the current prompt's embedding faster than it adds signal.
+
+\textbf{Per-class structure.} On the best single-split model, per-class F1 is
+\texttt{debug} 0.72, \texttt{implement} 0.62, \texttt{explain} 0.41,
+\texttt{review} 0.26, \texttt{other} 0.23, \texttt{tool\_only} 0.04. The classes
+the model predicts are the ones the labelers agree on; the ones it cannot are
+exactly those Section 3 shows to be unstable. \texttt{tool\_only} is near
+unpredictable from prompt text --- consistent with it being a property of the
+agent's harness rather than of what the developer asked for.
+
+\section{A Cautionary Result on Our Own Pipeline}
+
+The first version of this pipeline reported the prompt-only $\rightarrow$
++history comparison as $0.237 \rightarrow 0.412$ macro-F1: a 74\% relative
+improvement, and a publishable-looking headline. Fixing the parser took it to
+$0.223 \rightarrow 0.348$ ($\Delta = +0.125$); relabeling took it to the
+$+0.023$ reported above.
+
+The \textbf{parser bug}: SpecStory splits one logical agent turn across several
+consecutive Markdown blocks, and our parser read only the first, silently
+emptying a large share of \texttt{agent\_response} values. The rule labeler
+routed those blank responses into \texttt{other}/\texttt{review} by default,
+making the affected rows trivially predictable once the previous (equally
+affected) turn's label was known. It was not caught by a test; it was caught by
+asking why inter-labeler agreement was anomalously near zero for exactly two
+classes, sampling a disagreement, and reading the raw transcript. The
+\textbf{label change} accounts for most of the remaining shrinkage, consistent
+with Section 3: the rule label is partly a function of response-side surface
+features that persist across adjacent turns, so \texttt{prev\_action\_type}
+carried more autocorrelation under rule labels than under labels assigned by
+reading the turn.
+
+The failure mode is intrinsic to trajectory mining: transcript formats are
+undocumented, heterogeneous and evolving, and a parser that silently drops
+content yields a corpus that looks fine, trains fine, and reports a stronger
+effect than the truth. A class-level agreement breakdown between two independent
+labelers is a cheap and unusually effective canary for it.
+
+\section{Limitations and Discussion}
+
+Human adjudication is single-annotator over 98 turns and not blind to the LLM's
+label; we report no inter-human agreement, and the $\kappa = 0.727$ figure
+assumes unadjudicated rule/LLM agreements are correct. A fresh 240-turn sample
+from the final label set is released unadjudicated; adjudicating it is the
+obvious next step. Paired tests over 5 folds have low power. The per-repository
+cap samples turns, so a turn's immediate predecessor may not survive into the
+corpus even though its history features were computed from the complete session
+--- valid per row, but it disadvantages the prior-turn-text experiment. We did not
+fine-tune a transformer, nor evaluate the LLM judge as a zero-shot
+\emph{predictor} from the prompt alone --- an upper bound we would want before
+concluding the task is hard rather than our models weak.
+
+The workshop's premise is that we need better ways to describe what agents do.
+Our experience suggests the descriptive step is not a preliminary to the
+analysis; it dominates it. Our six categories are conventional, our two labelers
+were both reasonable, and they still produced corpora supporting opposite
+conclusions about how much of coding-agent work is debugging --- and rewriting two
+sentences of the category definitions moved that conclusion again, with the
+labeler held fixed. Reported behavior distributions in this literature are, we
+suspect, less robust than they appear. We would go further than ``report an
+agreement number'': a behavior taxonomy should be published together with the
+exact definition text used to apply it, since that text is doing measurable work
+that the category names conceal. On prediction: agent action type is weakly
+anticipatable from developer language, mostly through session stickiness rather
+than prompt semantics. We think that is worth reporting as a negative result, and
+worth revisiting once labels exist that a predictor could be fairly scored
+against.
+
+\paragraph{Artifacts.} Corpus, three label sets, the human review sheet, all
+result tables (including per-fold CV and paired significance tests), and the
+pipeline: \url{https://github.com/medhab123/Prompt_Research}.
+
+\begin{thebibliography}{9}
+\small
+\bibitem{tang2026programming}
+Tang, Chen, Fang, Xu, Dhakal, Shi, McMillan, Huang, Li.
+\emph{Programming by Chat: A Large-Scale Behavioral Analysis of 11,579
+Real-World AI-Assisted IDE Sessions.} arXiv:2604.00436.
+
+\bibitem{fang2026conversation}
+Fang, Zhang, Tang, McMillan, Li, Huang.
+\emph{From Conversation to Contribution: Characterizing Coding Agents in
+Open-Source Software.} arXiv:2607.05677.
+
+\bibitem{ong2024routellm}
+Ong, Almahairi, Wu, Chiang, Wu, Gonzalez, Kadous, Stoica.
+\emph{RouteLLM: Learning to Route LLMs with Preference Data.} arXiv:2406.18665.
+\end{thebibliography}
+
+\end{document}

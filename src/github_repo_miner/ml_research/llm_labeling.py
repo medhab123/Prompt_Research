@@ -27,13 +27,19 @@ import pandas as pd
 
 ACTION_TYPES = ["implement", "debug", "explain", "review", "tool_only", "other"]
 
-# Definitions below encode the working taxonomy established during the human
-# adjudication pass over rule-vs-LLM disagreements (2026-08-26), not just the
-# original generic descriptions — that review found the LLM systematically
-# under-called `debug` (calling a diagnosed-and-fixed bug `explain` when there
-# was no hard stack trace) and that `review` needed an explicit "no reported
-# problem driving it" criterion to stop it bleeding into `debug`/`implement`.
-ACTION_DEFINITIONS = {
+# Production prompt: the detailed action_type codebook (definitions, boundary
+# rules and worked examples). Edit prompts/action_type_codebook.md to change it.
+CODEBOOK_PATH = Path(__file__).parent / "prompts" / "action_type_codebook.md"
+_SYSTEM_INSTRUCTIONS = CODEBOOK_PATH.read_text(encoding="utf-8")
+
+# LEGACY (PROMPT_VERSION "v2-taxonomy-fix"): the prompt that produced
+# outputs/llm_labels_v3/llm_labels_full.csv. Kept verbatim so that labeling
+# can be reproduced; not used for new labeling.
+# It encoded the working taxonomy from the human adjudication pass over
+# rule-vs-LLM disagreements (2026-08-26) — that review found the LLM
+# under-called `debug` without a stack trace and that `review` needed an
+# explicit "no reported problem driving it" criterion.
+LEGACY_ACTION_DEFINITIONS = {
     "implement": "The agent writes substantial code, modifies files, or creates new functionality.",
     "debug": (
         "The agent diagnoses a REPORTED problem (an explicit crash/exception/error/build-failure, "
@@ -54,12 +60,12 @@ ACTION_DEFINITIONS = {
     "other": "Short, ambiguous, incomplete, or unclear interactions.",
 }
 
-_SYSTEM_INSTRUCTIONS = f"""You are labeling turns from real developer-to-AI-coding-agent conversations
+LEGACY_SYSTEM_INSTRUCTIONS = f"""You are labeling turns from real developer-to-AI-coding-agent conversations
 for a research dataset. Given a developer prompt, the agent's response, and
 some response metadata, classify what the agent's PRIMARY action was into
 exactly one of these six categories:
 
-{chr(10).join(f"- {k}: {v}" for k, v in ACTION_DEFINITIONS.items())}
+{chr(10).join(f"- {k}: {v}" for k, v in LEGACY_ACTION_DEFINITIONS.items())}
 
 Rules:
 - Pick exactly one category, even if the turn has elements of several — pick the dominant one.
@@ -85,12 +91,20 @@ Rules:
 _PROMPT_TRUNCATE = 4000
 _RESPONSE_TRUNCATE = 20000
 
-# Bump this whenever ACTION_DEFINITIONS, _SYSTEM_INSTRUCTIONS, or the truncation
+# Bump this whenever the codebook, the row prompt layout, or the truncation
 # limits change — it's folded into the cache key so stale labels from an older,
 # less-accurate prompt version can never silently masquerade as already-done
 # under a corrected one. This is what makes a corpus-wide prompt fix safe to ship
 # without a manual cache wipe.
-PROMPT_VERSION = "v2-taxonomy-fix"
+PROMPT_VERSION = "v3-codebook"
+LEGACY_PROMPT_VERSION = "v2-taxonomy-fix"
+_PREV_TURN_TRUNCATE = 1500  # same cap the human gold sheet shows
+
+# Sampling temperature for every labeling call (both providers). 0 = greedy
+# decoding, so re-running the same prompt should give the same label (APIs are
+# still not guaranteed bit-for-bit deterministic). Folded into the cache key so
+# labels produced at a different temperature are never served from cache.
+LABEL_TEMPERATURE = 0.0
 
 
 @dataclass
@@ -109,9 +123,29 @@ def _truncate(text: str, max_chars: int) -> str:
     return text[:max_chars] + f"...[truncated, {len(text)} chars total]"
 
 
-def _row_hash(prompt_text: str, agent_response: str) -> str:
-    key = f"{PROMPT_VERSION}||{prompt_text}||{agent_response}"
+def _row_hash(prompt_text: str, agent_response: str, prompt_version: str | None = None, prev_turn: str = "") -> str:
+    key = f"{prompt_version or PROMPT_VERSION}||temp={LABEL_TEMPERATURE}||{prompt_text}||{agent_response}"
+    if prev_turn:  # only when present, so prev-turn-free runs keep their existing cache keys
+        key += f"||prev={prev_turn}"
     return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def attach_previous_turn(df: pd.DataFrame, corpus: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Add prev_prompt/prev_response columns from the preceding turn of the same session.
+
+    `corpus` is where the preceding turns are looked up (default: df itself), so a
+    sample can still get context from turns that were not sampled.
+    """
+    source = df if corpus is None else corpus
+    need = {"session_id", "turn_index", "prompt_text", "agent_response"}
+    if not need.issubset(source.columns) or not {"session_id", "turn_index"}.issubset(df.columns):
+        return df
+    src = source[list(need)].sort_values(["session_id", "turn_index"]).drop_duplicates(["session_id", "turn_index"])
+    grouped = src.groupby("session_id")
+    src = src.assign(prev_prompt=grouped["prompt_text"].shift(), prev_response=grouped["agent_response"].shift())
+    out = df.drop(columns=["prev_prompt", "prev_response"], errors="ignore")
+    return out.merge(src[["session_id", "turn_index", "prev_prompt", "prev_response"]],
+                     on=["session_id", "turn_index"], how="left").set_axis(out.index)
 
 
 def select_exemplars(df: pd.DataFrame, n_per_class: int = 1, label_col: str = "action_type") -> list[dict]:
@@ -164,13 +198,23 @@ def build_row_prompt(
     has_tool_use: bool = False,
     code_block_count: int = 0,
     exemplars_text: str = "",
+    system_instructions: str | None = None,
+    prev_prompt: str = "",
+    prev_response: str = "",
 ) -> str:
-    return f"""{_SYSTEM_INSTRUCTIONS}
+    context = ""
+    if prev_prompt or prev_response:
+        context = (
+            "Previous turn in this session (context only — do NOT label it):\n"
+            f"Previous developer prompt: {_truncate(prev_prompt, _PREV_TURN_TRUNCATE)!r}\n"
+            f"Previous agent response: {_truncate(prev_response, _PREV_TURN_TRUNCATE)!r}\n\n"
+        )
+    return f"""{system_instructions or _SYSTEM_INSTRUCTIONS}
 
 {exemplars_text}
 Now classify this turn:
 
-Developer prompt: {_truncate(prompt_text, _PROMPT_TRUNCATE)!r}
+{context}Developer prompt: {_truncate(prompt_text, _PROMPT_TRUNCATE)!r}
 Agent response: {_truncate(agent_response, _RESPONSE_TRUNCATE)!r}
 Metadata: has_generated_code={has_generated_code}, has_tool_use={has_tool_use}, code_block_count={code_block_count}
 
@@ -228,7 +272,7 @@ class GeminiLabeler:
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                temperature=0.1,
+                temperature=LABEL_TEMPERATURE,
             ),
         )
         return _parse_response(response.text or "")
@@ -245,7 +289,7 @@ class GroqLabeler:
         completion = self.client.chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
+            temperature=LABEL_TEMPERATURE,
             response_format={"type": "json_object"},
         )
         return _parse_response(completion.choices[0].message.content or "")
@@ -331,6 +375,9 @@ def _label_one_row(
     has_tool_use: bool,
     code_block_count: int,
     exemplars_text: str,
+    system_instructions: str | None,
+    prev_prompt: str,
+    prev_response: str,
     rate_limiter: "_RateLimiter",
     max_retries: int,
     stop_event,
@@ -349,6 +396,9 @@ def _label_one_row(
         has_tool_use=has_tool_use,
         code_block_count=code_block_count,
         exemplars_text=exemplars_text,
+        system_instructions=system_instructions,
+        prev_prompt=prev_prompt,
+        prev_response=prev_response,
     )
 
     for attempt in range(max_retries):
@@ -391,6 +441,9 @@ def label_dataframe(
     rate_limit_delay: float = 3.0,
     max_retries: int = 3,
     max_workers: int = 4,
+    system_instructions: str | None = None,
+    prompt_version: str | None = None,
+    exemplars_text: str | None = None,
 ) -> pd.DataFrame:
     """Label every row of df; returns df with llm_action_type/llm_confidence/llm_rationale columns.
 
@@ -416,8 +469,17 @@ def label_dataframe(
     print(f"Using provider={provider_name} model={model or '(default)'} workers={max_workers} "
           f"min_interval={rate_limit_delay}s", flush=True)
 
-    exemplars = select_exemplars(df) if "action_type" in df.columns else []
-    exemplars_text = _format_exemplars(exemplars)
+    # system_instructions/prompt_version/exemplars_text let a caller swap the
+    # taxonomy text while holding everything else fixed.
+    # No corpus exemplars by default: select_exemplars picks them by the rule label,
+    # which is wrong often enough (2 of 5 picks mislabeled) to teach the model
+    # wrong boundaries; the codebook carries hand-checked worked examples instead.
+    if exemplars_text is None:
+        exemplars_text = ""
+
+    def _text(row: pd.Series, col: str) -> str:
+        value = row.get(col, "")
+        return "" if pd.isna(value) else str(value)
 
     cache = load_label_cache(cache_path)
     out = df.copy()
@@ -430,7 +492,8 @@ def label_dataframe(
     for idx, row in out.iterrows():
         prompt_text = str(row.get("prompt_text", ""))
         agent_response = str(row.get("agent_response", ""))
-        key = _row_hash(prompt_text, agent_response)
+        prev_turn = _text(row, "prev_prompt") + "||" + _text(row, "prev_response")
+        key = _row_hash(prompt_text, agent_response, prompt_version, prev_turn if prev_turn != "||" else "")
         if key in cache:
             cached = cache[key]
             out.at[idx, "llm_action_type"] = cached["action_type"]
@@ -468,6 +531,9 @@ def label_dataframe(
                 has_tool_use=bool(row.get("has_tool_use", False)),
                 code_block_count=int(row.get("code_block_count", 0) or 0),
                 exemplars_text=exemplars_text,
+                system_instructions=system_instructions,
+                prev_prompt=_text(row, "prev_prompt"),
+                prev_response=_text(row, "prev_response"),
                 rate_limiter=rate_limiter,
                 max_retries=max_retries,
                 stop_event=stop_event,

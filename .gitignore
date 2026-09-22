@@ -9,3 +9,7 @@ outputs/*.csv
 outputs/
 archive/
 node_modules/
+.claude/
+.DS_Store
+build/
+dist/

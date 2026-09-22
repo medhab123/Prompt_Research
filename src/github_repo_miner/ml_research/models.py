@@ -101,8 +101,16 @@ def train_classifiers(
         else:
             fit_x = x_train if name == "random_forest" and sparse_input else x_tr
             pred_x = x_test if name == "random_forest" and sparse_input else x_te
-            model.fit(fit_x, y_train)
-            y_pred = model.predict(pred_x)
+            if name == "xgboost":
+                # XGBoost needs labels 0..k-1 with none missing. A small corpus can
+                # leave a class out of a training fold, so fit on contiguous codes
+                # and map predictions back (identity when every class is present).
+                present = np.unique(y_train)
+                model.fit(fit_x, np.searchsorted(present, y_train))
+                y_pred = present[model.predict(pred_x)]
+            else:
+                model.fit(fit_x, y_train)
+                y_pred = model.predict(pred_x)
             y_proba = model.predict_proba(pred_x) if hasattr(model, "predict_proba") else None
             importances = getattr(model, "feature_importances_", None)
 

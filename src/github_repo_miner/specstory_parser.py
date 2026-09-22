@@ -25,6 +25,22 @@ _SPEAKER_MODEL_RE = re.compile(r"\(([^)]+)\)")
 _CODE_FENCE_RE = re.compile(r"```(\w+)?[^\n]*\n(.*?)```", re.DOTALL)
 _TOOL_BLOCK_RE = re.compile(r"<tool-use\b.*?</tool-use>", re.DOTALL | re.IGNORECASE)
 _TOOL_NAME_RE = re.compile(r'data-tool-name="([^"]*)"')
+# Older SpecStory/Cursor exports have no <tool-use> blocks; tool calls appear as
+# collapsible <details><summary>Edit file…</summary>, "Read file: path" lines,
+# "Tool use: **name**", MCP "*Called tool*", or bare `_****_` placeholders
+# right before the diff/command. Matching only <tool-use> left ~2,450 of the
+# 8,404 corpus turns with has_tool_use=False despite visible tool calls.
+_LEGACY_TOOL_TRACE_RE = re.compile(
+    r"<summary>\s*(?:Edit file|Grep search|Grep for|Listed (?:current )?directory|"
+    r"Searched (?:codebase|web|files)|MCP tool call|Read lints|Apply patch|Tool use|"
+    r"Read file|Deleted file|Ran tool)"
+    r"|^\s*Read file: \S"
+    r"|Tool use: \*\*\w"
+    r"|\*Called tool\*"
+    r"|^\s*_\*\*\*\*_\s*$"
+    r"|\[tool: [^\]\n]+\]",
+    re.IGNORECASE | re.MULTILINE,
+)
 CODE_BLOCK_JOINER = "\n\n<<CODE_BLOCK>>\n\n"
 
 
@@ -101,8 +117,14 @@ def _extract_code_blocks(text: str) -> tuple[list[str], list[str]]:
     return blocks, langs
 
 
+def text_has_tool_use(text: str) -> bool:
+    """Tool-call evidence in raw turn text or an already-cleaned agent_response."""
+    text = text if isinstance(text, str) else ""
+    return bool(_TOOL_BLOCK_RE.search(text) or _LEGACY_TOOL_TRACE_RE.search(text))
+
+
 def _turn_has_tool_use(lines: list[str]) -> bool:
-    return bool(_TOOL_BLOCK_RE.search("\n".join(lines)))
+    return text_has_tool_use("\n".join(lines))
 
 
 def parse_specstory_turns(text: str) -> list[SpecStoryTurnPair]:

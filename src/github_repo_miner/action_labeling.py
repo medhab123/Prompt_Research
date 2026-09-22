@@ -20,6 +20,23 @@ DEBUG_PROMPT = re.compile(
     r"uncaught|referenceerror|typeerror)\b",
     re.IGNORECASE,
 )
+# v3: problem-report phrasings the v1 list missed ("didn't work", "still not
+# centered", "can't click", "throws"). Kept only phrasings whose new debug calls
+# agreed with the LLM label >=60% of the time on the corpus (2026-09-17); generic
+# words ("issue", "problem", "warning", "failure") agreed <50% and were left out
+# because they also appear in ordinary feature requests.
+DEBUG_PROMPT_V3_EXTRA = re.compile(
+    r"\b(didn'?t work|does not work|do not work|isn'?t working|aren'?t working|no longer works?|"
+    r"stopped working|still (?:not|doesn'?t|don'?t|isn'?t|aren'?t|broken|wrong|happening|there|shows?|"
+    r"showing|appears?|getting|seeing|fails?|failing)|not (?:correct|right|showing|displaying|loading|"
+    r"rendering|updating|saving|responsive|centered|aligned|clickable|visible|appearing|triggering|"
+    r"firing|found)|doesn'?t (?:show|display|load|appear|update|save|respond|render|open|close|compile|"
+    r"build|run|start|exist)|can'?t (?:click|see|find|load|open|access|connect|resolve|import)|"
+    r"cannot (?:find|read|resolve|access|connect|import|load|open)|unable to|nothing happens|wrong|"
+    r"incorrect|messed up|throws?|thrown|segfault|panic(?:ked)?|hangs?|freez(?:es|ing)|stuck)\b"
+    r"|Error:|\bERROR\b",
+    re.IGNORECASE,
+)
 EXPLAIN_PROMPT = re.compile(
     r"\b(why|how|what|explain|describe|clarify|understand|difference between|"
     r"walk me through|help me understand)\b",
@@ -44,6 +61,41 @@ TEST_PROMPT = re.compile(
 SUBSTANTIAL_CODE_CHARS = 350
 SUBSTANTIAL_CODE_BLOCKS = 2
 
+# v1: the original rules, behind the rule-baseline numbers in paper/NUMBERS.md.
+# v2 (2026-09-17): same keyword lists and thresholds, two ordering bugs fixed:
+#   - debug keywords were only consulted after the code-volume rule, so a bug
+#     report answered with a multi-block fix was always "implement";
+#   - "tools used, no code block" returned tool_only before looking at what the
+#     tools did, so edits made through Edit/apply_patch were never "implement".
+# v3 (2026-09-17): v2 plus DEBUG_PROMPT_V3_EXTRA problem-report phrasings.
+RULE_VERSIONS = ("v1", "v2", "v3")
+RULE_VERSION = "v3"
+
+# Tool names as they survive in agent_response: "[tool: X]" markers,
+# "Tool use: **X**", and legacy "<summary>Edit file" collapsibles.
+_TOOL_NAME_IN_RESPONSE_RE = re.compile(
+    r"\[tool: ([^\]\n]+)\]|Tool use: \*\*([\w\-]+)\*\*|<summary>\s*(Edit file|Apply patch|Deleted file)",
+    re.IGNORECASE,
+)
+_EDIT_TOOL_RE = re.compile(r"edit|write|replace|patch|create_?file|delete", re.IGNORECASE)
+_NON_EDIT_TOOL_RE = re.compile(r"todo|stdin|plan", re.IGNORECASE)
+_TOOL_MARKUP_RE = re.compile(
+    r"\[tool: [^\]\n]+\]|Tool use: \*\*[\w\-]+\*\*|<details>.*?</details>|_\*\*\*\*_|^[ \t]*Read file: [^\n]*",
+    re.IGNORECASE | re.DOTALL | re.MULTILINE,
+)
+# Prose left after tool markup is stripped, above which a read-only tool turn
+# counts as having answered (explain/review) rather than just exploring.
+TOOL_TURN_ANSWER_CHARS = 200
+
+
+def response_uses_edit_tools(agent_response: str) -> bool:
+    """True if the response shows a file-modifying tool call (Edit, apply_patch, …)."""
+    for match in _TOOL_NAME_IN_RESPONSE_RE.finditer(str(agent_response or "")):
+        name = next(g for g in match.groups() if g)
+        if _EDIT_TOOL_RE.search(name) and not _NON_EDIT_TOOL_RE.search(name):
+            return True
+    return False
+
 
 def infer_agent_action(
     prompt_text: str,
@@ -53,19 +105,48 @@ def infer_agent_action(
     has_tool_use: bool = False,
     code_block_count: int = 0,
     generated_code: str = "",
+    rule_version: str = RULE_VERSION,
 ) -> ActionType:
     """
     Infer what the agent primarily did on this turn.
 
     Uses both the developer prompt and the agent response. This is intentionally
     rule-based: it is a bootstrap label to train on and audit, not ground truth.
+    `rule_version="v1"` reproduces the original labels.
     """
+    if rule_version not in RULE_VERSIONS:
+        raise ValueError(f"unknown rule_version {rule_version!r}; expected one of {RULE_VERSIONS}")
     prompt = str(prompt_text or "").strip()
     response = str(agent_response or "").strip()
     if response == "nan":
         response = ""
     code_len = len(str(generated_code or "").strip())
     blocks = int(code_block_count or 0)
+
+    if rule_version in ("v2", "v3"):
+        is_debug_prompt = bool(DEBUG_PROMPT.search(prompt)) or (
+            rule_version == "v3" and bool(DEBUG_PROMPT_V3_EXTRA.search(prompt))
+        )
+        is_explain_prompt = bool(EXPLAIN_PROMPT.search(prompt)) or "?" in prompt
+        is_implement_prompt = bool(IMPLEMENT_PROMPT.search(prompt))
+        is_review_prompt = bool(REVIEW_PROMPT.search(prompt))
+
+        # A reported problem the agent acted on is debug, whatever form the
+        # fix took (code blocks, tool edits, or a substantive written diagnosis).
+        if is_debug_prompt and (has_generated_code or has_tool_use or len(response) > 80):
+            return "debug"
+
+        if has_tool_use and blocks == 0:
+            if response_uses_edit_tools(response):
+                return "implement"
+            prose = _TOOL_MARKUP_RE.sub(" ", response).strip()
+            if len(prose) >= TOOL_TURN_ANSWER_CHARS:
+                if is_explain_prompt and not is_implement_prompt:
+                    return "explain"
+                if is_review_prompt:
+                    return "review"
+            return "tool_only"
+        # Remaining cases are unchanged from v1 (debug prompts already handled).
 
     is_debug_prompt = bool(DEBUG_PROMPT.search(prompt))
     is_explain_prompt = bool(EXPLAIN_PROMPT.search(prompt)) or "?" in prompt
@@ -111,7 +192,7 @@ def infer_agent_action(
     return "explain" if len(response) > 0 else "other"
 
 
-def add_action_labels(df):
+def add_action_labels(df, *, rule_version: str = RULE_VERSION):
     """Add `action_type` column to a turn-pair dataframe."""
     import pandas as pd
 
@@ -124,6 +205,7 @@ def add_action_labels(df):
             has_tool_use=bool(row.get("has_tool_use", False)),
             code_block_count=int(row.get("code_block_count", 0) or 0),
             generated_code=str(row.get("generated_code", "") or ""),
+            rule_version=rule_version,
         )
         for _, row in out.iterrows()
     ]

@@ -19,6 +19,36 @@ _CODE_FENCE_RE = re.compile(r"```[\s\S]*?```", re.MULTILINE)
 _CACHE_VERSION = 1
 _MAX_CHUNK_CHARS = 3500
 _TRANSLATE_SLEEP_SEC = 0.15
+_TRANSLATE_RETRIES = 2
+_RETRY_BACKOFF_SEC = 5.0
+
+# deep_translator's GoogleTranslator sometimes *returns* Google's HTTP error page
+# as if it were the translation instead of raising. Unchecked, that page was
+# written into prompt_text and cached, replacing 225 corpus prompts with
+# "Error 500 (Server Error)!!1500.That's an error..." (found 2026-09-17).
+_FAILED_TRANSLATION_RE = re.compile(
+    r"That[’']s an error|Error \d{3} \(Server Error\)|<!DOCTYPE html|<html[\s>]|"
+    r"Too Many Requests|Service Unavailable|unusual traffic from your computer",
+    re.IGNORECASE,
+)
+
+
+class TranslationError(RuntimeError):
+    """The translation backend returned an error page or empty output."""
+
+
+def looks_like_failed_translation(source: str, translated) -> bool:
+    """True if `translated` is an error page / empty rather than a translation of `source`.
+
+    A marker only counts if it is absent from the source, so a prompt that
+    legitimately quotes an HTML error page still translates normally.
+    """
+    if not isinstance(translated, str) or not translated.strip():
+        return bool(str(source or "").strip())
+    return any(
+        not re.search(re.escape(m.group(0)), str(source or ""), re.IGNORECASE)
+        for m in _FAILED_TRANSLATION_RE.finditer(translated)
+    )
 
 
 def _text_hash(text: str) -> str:
@@ -94,15 +124,36 @@ def _translate_plain(text: str, *, target: str = "en") -> str:
     from deep_translator import GoogleTranslator
 
     translator = GoogleTranslator(source="auto", target=target)
+
+    def _one(chunk: str) -> str:
+        for attempt in range(_TRANSLATE_RETRIES + 1):
+            out = translator.translate(chunk)
+            if not looks_like_failed_translation(chunk, out):
+                return out
+            if attempt < _TRANSLATE_RETRIES:
+                time.sleep(_RETRY_BACKOFF_SEC * (attempt + 1))
+        raise TranslationError("translator returned an error page or empty output")
+
     chunks = _chunk_text(text)
     if len(chunks) == 1:
-        return translator.translate(chunks[0])
+        return _one(chunks[0])
 
     translated: list[str] = []
     for chunk in chunks:
-        translated.append(translator.translate(chunk))
+        translated.append(_one(chunk))
         time.sleep(_TRANSLATE_SLEEP_SEC)
     return "".join(translated)
+
+
+def _cached_translation(text: str, cache: dict[str, str]) -> str | None:
+    """Cache lookup that ignores (and evicts) poisoned entries from older runs."""
+    key = _text_hash(text)
+    if key not in cache:
+        return None
+    if looks_like_failed_translation(text, cache[key]):
+        del cache[key]
+        return None
+    return cache[key]
 
 
 def translate_preserving_code(text: str, cache: dict[str, str]) -> tuple[str, bool]:
@@ -114,8 +165,9 @@ def translate_preserving_code(text: str, cache: dict[str, str]) -> tuple[str, bo
         return text, False
 
     key = _text_hash(text)
-    if key in cache:
-        return cache[key], True
+    cached = _cached_translation(text, cache)
+    if cached is not None:
+        return cached, True
 
     placeholders: dict[str, str] = {}
 
@@ -186,8 +238,9 @@ def translate_text_column(
                 out, did = text, False
             else:
                 key = _text_hash(text)
-                if key in cache:
-                    out, did = cache[key], True
+                cached = _cached_translation(text, cache)
+                if cached is not None:
+                    out, did = cached, True
                 else:
                     try:
                         out = _translate_plain(text)

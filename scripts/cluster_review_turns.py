@@ -26,7 +26,7 @@ from sklearn.metrics import silhouette_score
 
 ROOT = Path(__file__).resolve().parent.parent
 CORPUS = ROOT / "outputs/full_run_v3_analysis/specstory_prompts_cleaned.csv"
-LLM_LABELS = ROOT / "outputs/llm_labels_v3/llm_labels_full.csv"
+LLM_LABELS = ROOT / "outputs/llm_labels_v4/llm_labels_full.csv"
 KEYS = ["full_name", "source_file", "turn_index"]
 RESPONSE_CHARS = 1500
 K_RANGE = range(2, 9)

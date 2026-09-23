@@ -29,7 +29,14 @@ ACTION_TYPES = ["implement", "debug", "explain", "review", "tool_only", "other"]
 
 # Production prompt: the detailed action_type codebook (definitions, boundary
 # rules and worked examples). Edit prompts/action_type_codebook.md to change it.
-CODEBOOK_PATH = Path(__file__).parent / "prompts" / "action_type_codebook.md"
+# Production prompt: the operational codebook, whose categories turn on three
+# explicit tests (was a change applied, was a problem reported, is there a
+# verdict). Chosen on a blind 98-turn hand-graded reference set, where it scored
+# 86.7% / kappa 0.81 against the grader, the best of the candidates tested, and
+# it is about a third the length of the earlier detailed codebook.
+# The earlier codebook is kept beside it as an alternative definition text.
+CODEBOOK_PATH = Path(__file__).parent / "prompts" / "action_type_strict.md"
+DETAILED_CODEBOOK_PATH = Path(__file__).parent / "prompts" / "action_type_codebook.md"
 _SYSTEM_INSTRUCTIONS = CODEBOOK_PATH.read_text(encoding="utf-8")
 
 # LEGACY (PROMPT_VERSION "v2-taxonomy-fix"): the prompt that produced
@@ -96,7 +103,7 @@ _RESPONSE_TRUNCATE = 20000
 # less-accurate prompt version can never silently masquerade as already-done
 # under a corrected one. This is what makes a corpus-wide prompt fix safe to ship
 # without a manual cache wipe.
-PROMPT_VERSION = "v3-codebook"
+PROMPT_VERSION = "v4-strict"
 LEGACY_PROMPT_VERSION = "v2-taxonomy-fix"
 _PREV_TURN_TRUNCATE = 1500  # same cap the human gold sheet shows
 

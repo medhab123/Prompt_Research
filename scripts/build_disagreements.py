@@ -38,7 +38,7 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parent.parent
 CORPUS = ROOT / "outputs/full_run_v3_analysis/specstory_prompts_cleaned.csv"
-LLM_LABELS = ROOT / "outputs/llm_labels_v3/llm_labels_full.csv"
+LLM_LABELS = ROOT / "outputs/llm_labels_v4/llm_labels_full.csv"  # current labels; --llm-labels overrides
 PRE_REPAIR = ROOT / "outputs/provenance/corpus_pre_repair_2026-09-17/specstory_prompts_cleaned.csv"
 OUT = ROOT / "outputs/disagreements/rule_vs_llm_disagreements.csv"
 
@@ -66,6 +66,8 @@ CLUSTER_NAMES = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--output", type=Path, default=OUT)
+    parser.add_argument("--llm-labels", type=Path, default=LLM_LABELS,
+                        help="Label file to pair with the corpus (default: the current one).")
     parser.add_argument(
         "--old-ids",
         type=Path,
@@ -74,9 +76,12 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+ARGS = parse_args()
+
+
 def load_pairs() -> pd.DataFrame:
     corpus = pd.read_csv(CORPUS)
-    llm = pd.read_csv(LLM_LABELS, usecols=KEYS + LLM_COLS)
+    llm = pd.read_csv(ARGS.llm_labels, usecols=KEYS + LLM_COLS)
     if corpus.duplicated(KEYS).any() or llm.duplicated(KEYS).any():
         raise SystemExit("Duplicate (full_name, source_file, turn_index) keys; cannot pair rows safely.")
     corpus["row_index"] = range(len(corpus))
@@ -132,7 +137,7 @@ def assign_clusters(d: pd.DataFrame) -> pd.Series:
 
 
 def main() -> None:
-    args = parse_args()
+    args = ARGS
     df = load_pairs()
     print(f"Paired turns: {len(df)}")
 

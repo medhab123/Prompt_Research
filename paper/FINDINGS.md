@@ -81,9 +81,13 @@ reaches 77.6%. The gap is what the response itself contributes.
 
 ## Open items
 
-- Inter-annotator agreement: `outputs/gold_v2/second_annotator_sheet.xlsx` (40
-  turns) is waiting for an independent second labeling. The current HUMAN labels
-  are a consensus, so no κ can be reported yet.
+- Inter-annotator agreement (DONE): the second annotator re-labeled 40 turns
+  independently. Raw agreement 92.3%, Cohen's κ 0.897 on the 39 in common; the
+  three disagreements are all on the `explain` boundary. Candidate prompts rank
+  identically against either annotator, so the production-prompt choice does not
+  depend on whose labels are the reference. Caveat: that annotator took part in
+  the consensus pass, so this is nearer a test–retest check and bounds
+  reliability from above. Source: `outputs/gold_v2/INTERANNOTATOR.md`.
 - Mechanism validation: `outputs/disagreements/mechanism_validation_sheet.xlsx`
   (60 turns) is waiting for hand-coding, to check the automatic assignment.
 - All LLM results use one model family; a second family on a sample would

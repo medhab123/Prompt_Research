@@ -51,13 +51,15 @@ LABELS = ["implement", "debug", "explain", "review", "tool_only", "other"]
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--output", type=Path, default=GOLD_DIR / "PREDICT_HUMAN.md")
+    p.add_argument("--output", type=Path, default=None)
+    p.add_argument("--provider", choices=["gemini", "groq"], default="gemini")
+    p.add_argument("--model", default=None, help="Zero-shot model; default gemini-3.1-flash-lite.")
     p.add_argument("--bootstrap", type=int, default=2000)
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
 
-def zero_shot(rows: pd.DataFrame, cache: Path) -> pd.Series:
+def zero_shot(rows: pd.DataFrame, cache: Path, provider: str, model: str | None) -> pd.Series:
     """Reuse run_zeroshot_prediction's instructions so the two runs are comparable."""
     from importlib import util
     spec = util.spec_from_file_location("zs", ROOT / "scripts/run_zeroshot_prediction.py")
@@ -68,8 +70,17 @@ def zero_shot(rows: pd.DataFrame, cache: Path) -> pd.Series:
     todo = rows[~rows.index.isin(done["row"])]
     if len(todo):
         print(f"zero-shot: predicting {len(todo)} turns")
-        with ThreadPoolExecutor(6) as ex:
-            preds = list(ex.map(lambda r: zs.predict_one(zs.build_prompt(r[1], True)), todo.iterrows()))
+        if provider == "groq":  # free tier: a few calls a minute, so run serially
+            preds = []
+            for i, (_, r) in enumerate(todo.iterrows(), 1):
+                preds.append(zs.predict_one(zs.build_prompt(r, True), provider, model))
+                time.sleep(zs.GROQ_MIN_INTERVAL)
+                if i % 20 == 0:
+                    print(f"  {i}/{len(todo)}", flush=True)
+        else:
+            with ThreadPoolExecutor(6) as ex:
+                preds = list(ex.map(lambda r: zs.predict_one(zs.build_prompt(r[1], True), provider, model),
+                                    todo.iterrows()))
         done = pd.concat([done, pd.DataFrame({"row": todo.index, "pred": preds})], ignore_index=True)
         done.to_csv(cache, index=False)
     return done.set_index("row")["pred"]
@@ -104,8 +115,12 @@ def main() -> None:
         preds[name] = clf.predict(sc.transform(x[gold_rows]))
     preds["keyword rule on the prompt"] = np.array(
         prompt_keyword_rule_baseline(df.iloc[gold_rows]["prompt_text"].astype(str).tolist()))
-    zs = zero_shot(df.iloc[gold_rows], GOLD_DIR / "zeroshot_human_predictions.csv")
-    preds["zero-shot LLM (prompt only)"] = zs.reindex(gold_rows).to_numpy()
+    model_name = args.model or ("gemini-3.1-flash-lite" if args.provider == "gemini" else "openai/gpt-oss-120b")
+    tag = model_name.replace("/", "_")
+    if args.provider == "groq":  # keep caches for different reasoning budgets apart
+        tag += "_effort-" + os.getenv("GROQ_REASONING_EFFORT", "low")
+    zs = zero_shot(df.iloc[gold_rows], GOLD_DIR / f"zeroshot_human_predictions_{tag}.csv", args.provider, args.model)
+    preds[f"zero-shot {model_name} (prompt only)"] = zs.reindex(gold_rows).to_numpy()
 
     rng = np.random.default_rng(args.seed)
     groups = df["full_name"].to_numpy()[gold_rows]
@@ -136,9 +151,11 @@ def main() -> None:
           f"repositories that contribute none of them. Cluster bootstrap over repositories "
           f"({args.bootstrap} resamples).\n",
           summary.to_markdown(index=False), "",
+          f"Zero-shot model: `{model_name}` ({args.provider}), temperature 0.\n",
           "Note: labeling a turn (the agent's response is visible) and predicting it (only the prompt is "
           "visible) are different tasks; these numbers are the prediction task against human labels.\n"]
-    args.output.write_text("\n".join(md), encoding="utf-8")
+    out = args.output or (GOLD_DIR / f"PREDICT_HUMAN_{tag}.md")
+    out.write_text("\n".join(md), encoding="utf-8")
     print("\n".join(md))
 
 

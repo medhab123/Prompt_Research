@@ -87,7 +87,9 @@ reaches 77.6%. The gap is what the response itself contributes.
   identically against either annotator, so the production-prompt choice does not
   depend on whose labels are the reference. Caveat: that annotator took part in
   the consensus pass, so this is nearer a test–retest check and bounds
-  reliability from above. Source: `outputs/gold_v2/INTERANNOTATOR.md`.
+  reliability from above; no third annotator will be added (decided), so the
+  papers present the reference labels as a two-person consensus with an
+  optimistic reliability estimate. Source: `outputs/gold_v2/INTERANNOTATOR.md`.
 - Mechanism validation: `outputs/disagreements/mechanism_validation_sheet.xlsx`
   (60 turns) is waiting for hand-coding, to check the automatic assignment.
 - All LLM results use one model family; a second family on a sample would

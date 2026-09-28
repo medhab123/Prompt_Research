@@ -92,7 +92,13 @@ reaches 77.6%. The gap is what the response itself contributes.
   optimistic reliability estimate. Source: `outputs/gold_v2/INTERANNOTATOR.md`.
 - Mechanism validation: `outputs/disagreements/mechanism_validation_sheet.xlsx`
   (60 turns) is waiting for hand-coding, to check the automatic assignment.
-- All LLM results use one model family; a second family on a sample would
-  strengthen every LLM claim.
+- Multi-model zero-shot (DONE): three models, two families. Against human
+  labels gemini-3.1-flash-lite 0.584 / 77.6%, gemini-3.5-flash 0.544 / 77.6%,
+  gpt-oss-120b 0.422 / 63.3% (0.397 at low reasoning effort), vs 0.367 / 58.2%
+  for the best supervised pipeline. On the 280 held-out turns all three covered,
+  only gemini-3.1-flash-lite is clearly ahead of the supervised pipeline. So the
+  direction generalizes and the margin is model-dependent. gemini-3.5-flash
+  against rule labels could not be completed (1,423 of 1,734 calls failed on
+  quota) and is not reported. Sources: `outputs/ml_action_v4_*/zeroshot*/`.
 - n = 98 for HUMAN, so those CIs are wide (finding 10 spans 0.42–0.73).
 - Replication package and the generative-AI disclosure.
